@@ -122,6 +122,7 @@ pub use handler::{
 };
 use libp2p_core::{
     connection::ConnectedPoint,
+    multiaddr::Protocol,
     muxing::StreamMuxerBox,
     transport::{self, ListenerId, TransportError, TransportEvent},
     Multiaddr, Transport,
@@ -495,7 +496,11 @@ where
             let mut unique_addresses = HashSet::new();
             addresses_from_opts.retain(|addr| {
                 !self.listened_addrs.values().flatten().any(|a| a == addr)
-                    && unique_addresses.insert(addr.clone())
+                    && unique_addresses.insert(addr.clone()) && !addr.iter().any(|p| match p {
+                        Protocol::Ip4(ip) => ip.is_loopback(),
+                        Protocol::Ip6(ip) => ip.is_loopback(),
+                        _ => false,
+                    })
             });
 
             if addresses_from_opts.is_empty() {
