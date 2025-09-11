@@ -88,10 +88,7 @@ pub use handler::ProtocolSupport;
 use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
-    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm},
-    dial_opts::DialOpts,
-    ConnectionDenied, ConnectionHandler, ConnectionId, DialError, NetworkBehaviour, NotifyHandler,
-    PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm}, dial_opts::DialOpts, ConnectionDenied, ConnectionHandler, ConnectionId, DialError, NetworkBehaviour, NotifyHandler, PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm
 };
 use smallvec::SmallVec;
 
@@ -690,6 +687,7 @@ where
             peer_id,
             connection_id,
             error,
+            ..
         }: DialFailure,
     ) {
         if let DialError::DialPeerConditionFalse(_) = error {

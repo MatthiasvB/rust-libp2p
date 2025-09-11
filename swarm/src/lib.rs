@@ -438,6 +438,11 @@ where
             (PeerCondition::Disconnected, Some(peer_id)) => !self.pool.is_connected(peer_id),
             (PeerCondition::NotDialing, Some(peer_id)) => !self.pool.is_dialing(peer_id),
             (PeerCondition::DisconnectedAndNotDialing, Some(peer_id)) => {
+                println!(
+                    "Is dialing: {}  ---  Is connected: {}",
+                    self.pool.is_dialing(peer_id),
+                    self.pool.is_connected(peer_id)
+                );
                 !self.pool.is_dialing(peer_id) && !self.pool.is_connected(peer_id)
             }
         };
@@ -457,6 +462,10 @@ where
 
         let addresses = {
             let mut addresses_from_opts = dial_opts.get_addresses();
+            println!(
+                "Lip2p patch: Addresses from opts: {:?}",
+                addresses_from_opts
+            );
 
             match self.behaviour.handle_pending_outbound_connection(
                 connection_id,
@@ -466,8 +475,10 @@ where
             ) {
                 Ok(addresses) => {
                     if dial_opts.extend_addresses_through_behaviour() {
+                        println!("Lip2p patch: extending addresses by: {:?}", addresses);
                         addresses_from_opts.extend(addresses)
                     } else {
+                        println!("Lip2p patch: Not extending addresses");
                         let num_addresses = addresses.len();
 
                         if num_addresses > 0 {
@@ -496,12 +507,15 @@ where
             let mut unique_addresses = HashSet::new();
             addresses_from_opts.retain(|addr| {
                 !self.listened_addrs.values().flatten().any(|a| a == addr)
-                    && unique_addresses.insert(addr.clone()) && !addr.iter().any(|p| match p {
+                    && unique_addresses.insert(addr.clone())
+                    && !addr.iter().any(|p| match p {
                         Protocol::Ip4(ip) => ip.is_loopback(),
                         Protocol::Ip6(ip) => ip.is_loopback(),
                         _ => false,
                     })
             });
+
+            println!("Lip2p patch: Unique addresses: {:?}", unique_addresses);
 
             if addresses_from_opts.is_empty() {
                 let error = DialError::NoAddresses;
