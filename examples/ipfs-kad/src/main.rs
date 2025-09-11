@@ -83,29 +83,29 @@ async fn main() -> Result<()> {
 
     let cli_opt = Opt::parse();
 
-    match cli_opt.argument {
-        CliArgument::GetPeers { peer_id } => {
-            let peer_id = peer_id.unwrap_or(PeerId::random());
-            println!("Searching for the closest peers to {peer_id}");
-            swarm.behaviour_mut().get_closest_peers(peer_id);
-        }
-        CliArgument::PutPkRecord {} => {
-            println!("Putting PK record into the DHT");
+    // match cli_opt.argument {
+    //     CliArgument::GetPeers { peer_id } => {
+    //         let peer_id = peer_id.unwrap_or(PeerId::random());
+    //         println!("Searching for the closest peers to {peer_id}");
+    //         swarm.behaviour_mut().get_closest_peers(peer_id);
+    //     }
+    //     CliArgument::PutPkRecord {} => {
+    //         println!("Putting PK record into the DHT");
 
-            let mut pk_record_key = vec![];
-            pk_record_key.put_slice("/pk/".as_bytes());
-            pk_record_key.put_slice(swarm.local_peer_id().to_bytes().as_slice());
+    //         let mut pk_record_key = vec![];
+    //         pk_record_key.put_slice("/pk/".as_bytes());
+    //         pk_record_key.put_slice(swarm.local_peer_id().to_bytes().as_slice());
 
-            let mut pk_record =
-                kad::Record::new(pk_record_key, local_key.public().encode_protobuf());
-            pk_record.publisher = Some(*swarm.local_peer_id());
-            pk_record.expires = Some(Instant::now().add(Duration::from_secs(60)));
+    //         let mut pk_record =
+    //             kad::Record::new(pk_record_key, local_key.public().encode_protobuf());
+    //         pk_record.publisher = Some(*swarm.local_peer_id());
+    //         pk_record.expires = Some(Instant::now().add(Duration::from_secs(60)));
 
-            swarm
-                .behaviour_mut()
-                .put_record(pk_record, kad::Quorum::N(NonZeroUsize::new(3).unwrap()))?;
-        }
-    }
+    //         swarm
+    //             .behaviour_mut()
+    //             .put_record(pk_record, kad::Quorum::N(NonZeroUsize::new(3).unwrap()))?;
+    //     }
+    // }
 
     loop {
         let event = swarm.select_next_some().await;
@@ -148,6 +148,10 @@ async fn main() -> Result<()> {
             }) => {
                 bail!(anyhow::Error::new(err).context("Failed to insert the PK record"));
             }
+            SwarmEvent::Behaviour(event) => match event {
+                kad::Event::OutboundQueryProgressed { .. } => eprintln!("{event:?}"),
+                _ => {}
+            },
             _ => {}
         }
     }

@@ -1313,6 +1313,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 name = "file-sharing-example"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "futures",
  "libp2p",

@@ -1,9 +1,11 @@
 use std::{
     collections::{hash_map, HashMap, HashSet},
     error::Error,
+    thread::sleep,
     time::Duration,
 };
 
+use anyhow::bail;
 use futures::{
     channel::{mpsc, oneshot},
     prelude::*,
@@ -11,7 +13,7 @@ use futures::{
 };
 use libp2p::{
     core::Multiaddr,
-    identity, kad,
+    identify, identity, kad,
     multiaddr::Protocol,
     noise,
     request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel},
@@ -19,6 +21,13 @@ use libp2p::{
     tcp, yamux, PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
+
+const BOOTNODES: [&str; 4] = [
+    "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+    "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+];
 
 /// Creates the network components, namely:
 ///
@@ -41,6 +50,10 @@ pub(crate) async fn new(
     };
     let peer_id = id_keys.public().to_peer_id();
 
+    println!("Local peer id: {:?}", peer_id);
+
+    // sleep(Duration::from_secs(10));
+
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
         .with_tokio()
         .with_tcp(
@@ -48,6 +61,7 @@ pub(crate) async fn new(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_dns()?
         .with_behaviour(|key| Behaviour {
             kademlia: kad::Behaviour::new(
                 peer_id,
@@ -60,9 +74,20 @@ pub(crate) async fn new(
                 )],
                 request_response::Config::default(),
             ),
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ipfs/id/1.0.0".to_string(),
+                key.public(),
+            )),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
+
+    for peer in &BOOTNODES {
+        swarm.behaviour_mut().kademlia.add_address(
+            &peer.parse().unwrap(),
+            "/dnsaddr/bootstrap.libp2p.io".parse().unwrap(),
+        );
+    }
 
     swarm
         .behaviour_mut()
@@ -257,7 +282,6 @@ impl EventLoop {
                     ..
                 },
             )) => {}
-            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(_)) => {}
             SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
                 request_response::Event::Message { message, .. },
             )) => match message {
@@ -327,7 +351,59 @@ impl EventLoop {
                 peer_id: Some(peer_id),
                 ..
             } => eprintln!("Dialing {peer_id}"),
-            e => panic!("{e:?}"),
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::GetClosestPeers(Ok(ok)),
+                    ..
+                },
+            )) => {
+                // The example is considered failed as there
+                // should always be at least 1 reachable peer.
+                if ok.peers.is_empty() {
+                    eprintln!("Query finished with no closest peers.")
+                }
+
+                println!("Query finished with closest peers: {:#?}", ok.peers);
+
+                // return Ok(());
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    result:
+                        kad::QueryResult::GetClosestPeers(Err(kad::GetClosestPeersError::Timeout {
+                            ..
+                        })),
+                    ..
+                },
+            )) => {
+                eprintln!("Query for closest peers timed out")
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::PutRecord(Ok(_)),
+                    ..
+                },
+            )) => {
+                println!("Successfully inserted the PK record");
+
+                // return Ok(());
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::PutRecord(Err(err)),
+                    ..
+                },
+            )) => {
+                eprintln!("Failed to insert the PK record");
+            }
+            SwarmEvent::Behaviour(event) => match event {
+                BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { .. }) => {
+                    eprintln!("{event:?}")
+                }
+                _ => {}
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(_)) => {}
+            e => eprintln!("{e:?}"),
         }
     }
 
@@ -405,6 +481,7 @@ impl EventLoop {
 struct Behaviour {
     request_response: request_response::cbor::Behaviour<FileRequest, FileResponse>,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    identify: identify::Behaviour,
 }
 
 #[derive(Debug)]
