@@ -134,7 +134,7 @@ pub use listen_opts::ListenOpts;
 use smallvec::SmallVec;
 pub use stream::Stream;
 pub use stream_protocol::{InvalidProtocol, StreamProtocol};
-use tracing::Instrument;
+use tracing::{Instrument, trace};
 #[doc(hidden)]
 pub use translation::_address_translation;
 
@@ -438,7 +438,7 @@ where
             (PeerCondition::Disconnected, Some(peer_id)) => !self.pool.is_connected(peer_id),
             (PeerCondition::NotDialing, Some(peer_id)) => !self.pool.is_dialing(peer_id),
             (PeerCondition::DisconnectedAndNotDialing, Some(peer_id)) => {
-                println!(
+                trace!(
                     "Is dialing: {}  ---  Is connected: {}",
                     self.pool.is_dialing(peer_id),
                     self.pool.is_connected(peer_id)
@@ -462,8 +462,8 @@ where
 
         let addresses = {
             let mut addresses_from_opts = dial_opts.get_addresses();
-            println!(
-                "Lip2p patch: Addresses from opts: {:?}",
+            trace!(
+                "Libp2p patch: Addresses from opts: {:?}",
                 addresses_from_opts
             );
 
@@ -475,10 +475,10 @@ where
             ) {
                 Ok(addresses) => {
                     if dial_opts.extend_addresses_through_behaviour() {
-                        println!("Lip2p patch: extending addresses by: {:?}", addresses);
+                        trace!("Libp2p patch: extending addresses by: {:?}", addresses);
                         addresses_from_opts.extend(addresses)
                     } else {
-                        println!("Lip2p patch: Not extending addresses");
+                        trace!("Libp2p patch: Not extending addresses");
                         let num_addresses = addresses.len();
 
                         if num_addresses > 0 {
@@ -515,7 +515,7 @@ where
                     })
             });
 
-            println!("Lip2p patch: Unique addresses: {:?}", unique_addresses);
+            trace!("Libp2p patch: Unique addresses: {:?}", unique_addresses);
 
             if addresses_from_opts.is_empty() {
                 let error = DialError::NoAddresses;

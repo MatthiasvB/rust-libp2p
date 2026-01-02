@@ -107,7 +107,7 @@ async fn report_outbound_failure_on_write_request() {
             "FailOnWriteRequest"
         );
     };
-
+    
     let server_task = pin!(server_task);
     let client_task = pin!(client_task);
     futures::future::select(server_task, client_task).await;
