@@ -85,10 +85,13 @@ pub use codec::Codec;
 use futures::channel::oneshot;
 use handler::Handler;
 pub use handler::ProtocolSupport;
-use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
+use libp2p_core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
-    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm}, dial_opts::DialOpts, ConnectionDenied, ConnectionHandler, ConnectionId, DialError, NetworkBehaviour, NotifyHandler, PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm
+    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm},
+    dial_opts::DialOpts,
+    ConnectionDenied, ConnectionHandler, ConnectionId, DialError, NetworkBehaviour, NotifyHandler,
+    PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use smallvec::SmallVec;
 
@@ -383,6 +386,22 @@ where
     }
 }
 
+trait IsRelayed {
+    fn is_relayed(&self) -> bool;
+}
+
+impl IsRelayed for Multiaddr {
+    fn is_relayed(&self) -> bool {
+        self.iter().any(|p| p == Protocol::P2pCircuit)
+    }
+}
+
+impl IsRelayed for Option<Multiaddr> {
+    fn is_relayed(&self) -> bool {
+        self.as_ref().is_some_and(|addr| addr.is_relayed())
+    }
+}
+
 impl<TCodec> Behaviour<TCodec>
 where
     TCodec: Codec + Clone + Send + 'static,
@@ -566,10 +585,14 @@ where
         request: OutboundMessage<TCodec>,
     ) -> Option<OutboundMessage<TCodec>> {
         if let Some(connections) = self.connected.get_mut(peer) {
-            if connections.is_empty() {
+            let non_relay_connections = connections
+                .iter()
+                .filter(|conn| !conn.remote_address.is_relayed())
+                .collect::<Vec<_>>();
+            if non_relay_connections.is_empty() {
                 return Some(request);
             }
-            let ix = (request.request_id.0 as usize) % connections.len();
+            let ix = (request.request_id.0 as usize) % non_relay_connections.len();
             let conn = &mut connections[ix];
             conn.pending_outbound_responses.insert(request.request_id);
             self.pending_events.push_back(ToSwarm::NotifyHandler {
@@ -661,16 +684,22 @@ where
             ..
         }: ConnectionClosed,
     ) {
-        let connections = self
-            .connected
-            .get_mut(&peer_id)
-            .expect("Expected some established connection to peer before closing.");
+        let connections = match self.connected.get_mut(&peer_id) {
+            Some(x) => x,
+            None => {
+                return;
+            }
+        };
 
-        let connection = connections
-            .iter()
-            .position(|c| c.id == connection_id)
-            .map(|p: usize| connections.remove(p))
-            .expect("Expected connection to be established before closing.");
+        let connection = match connections
+                    .iter()
+                    .position(|c| c.id == connection_id)
+                    .map(|p: usize| connections.remove(p)) {
+            Some(conn) => conn,
+            None => {
+                return;
+            },
+        };
 
         debug_assert_eq!(connections.is_empty(), remaining_established == 0);
         if connections.is_empty() {
@@ -741,6 +770,10 @@ where
         connection_id: ConnectionId,
         remote_address: Option<Multiaddr>,
     ) {
+        if remote_address.is_relayed() {
+            // Do not preload requests on relay connections.
+            return;
+        }
         let mut connection = Connection::new(connection_id, remote_address);
 
         if let Some(pending_requests) = self.pending_outbound_requests.remove(&peer) {
