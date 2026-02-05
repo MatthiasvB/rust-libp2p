@@ -310,6 +310,10 @@ impl fmt::Display for OutboundRequestId {
 pub struct Config {
     request_timeout: Duration,
     max_concurrent_streams: usize,
+    /// When true (default), outbound requests can be sent over relay connections.
+    /// When false, only direct connections are used for requests, which conserves
+    /// relay bandwidth but may fail if no direct connection exists.
+    allow_relay_for_requests: bool,
 }
 
 impl Default for Config {
@@ -317,6 +321,7 @@ impl Default for Config {
         Self {
             request_timeout: Duration::from_secs(10),
             max_concurrent_streams: 100,
+            allow_relay_for_requests: true,
         }
     }
 }
@@ -338,6 +343,16 @@ impl Config {
     /// Sets the upper bound for the number of concurrent inbound + outbound streams.
     pub fn with_max_concurrent_streams(mut self, num_streams: usize) -> Self {
         self.max_concurrent_streams = num_streams;
+        self
+    }
+
+    /// Configures whether requests can be sent over relay connections.
+    /// 
+    /// By default, relay connections are used for outbound requests (enabled = true).
+    /// Set to `false` to only use direct connections, which conserves relay bandwidth
+    /// but may cause requests to fail if no direct connection to the peer exists.
+    pub fn with_relay_for_requests(mut self, enabled: bool) -> Self {
+        self.allow_relay_for_requests = enabled;
         self
     }
 }
@@ -569,15 +584,27 @@ where
         request: OutboundMessage<TCodec>,
     ) -> Option<OutboundMessage<TCodec>> {
         if let Some(connections) = self.connected.get_mut(peer) {
-            let non_relay_connections = connections
-                .iter()
-                .filter(|conn| !conn.remote_address.is_relayed())
-                .collect::<Vec<_>>();
-            if non_relay_connections.is_empty() {
+            // Determine eligible connection indices based on relay policy
+            let eligible_indices: Vec<usize> = if self.config.allow_relay_for_requests {
+                // All connections are eligible when relay is allowed
+                (0..connections.len()).collect()
+            } else {
+                // Only direct connections when relay is not allowed
+                connections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.remote_address.is_relayed())
+                    .map(|(idx, _)| idx)
+                    .collect()
+            };
+            
+            if eligible_indices.is_empty() {
                 return Some(request);
             }
-            let ix = (request.request_id.0 as usize) % non_relay_connections.len();
-            let conn = &mut connections[ix];
+            
+            // Round-robin selection among eligible connections
+            let pick = eligible_indices[request.request_id.0 as usize % eligible_indices.len()];
+            let conn = &mut connections[pick];
             conn.pending_outbound_responses.insert(request.request_id);
             self.pending_events.push_back(ToSwarm::NotifyHandler {
                 peer_id: *peer,
@@ -754,22 +781,27 @@ where
         connection_id: ConnectionId,
         remote_address: Option<Multiaddr>,
     ) {
-        if remote_address.is_relayed() {
-            // Do not preload requests on relay connections.
-            return;
-        }
-        let mut connection = Connection::new(connection_id, remote_address);
-
-        if let Some(pending_requests) = self.pending_outbound_requests.remove(&peer) {
-            for request in pending_requests {
-                connection
-                    .pending_outbound_responses
-                    .insert(request.request_id);
-                handler.on_behaviour_event(request);
+        let conn_entry = Connection::new(connection_id, remote_address.clone());
+        
+        // Always register the connection for proper state tracking.
+        // Only preload pending requests based on relay policy configuration.
+        let is_relay_conn = remote_address.is_relayed();
+        let should_preload = self.config.allow_relay_for_requests || !is_relay_conn;
+        
+        if should_preload {
+            if let Some(queued_requests) = self.pending_outbound_requests.remove(&peer) {
+                let conns = self.connected.entry(peer).or_default();
+                conns.push(conn_entry);
+                let conn_ref = conns.last_mut().expect("just pushed");
+                for req in queued_requests {
+                    conn_ref.pending_outbound_responses.insert(req.request_id);
+                    handler.on_behaviour_event(req);
+                }
+                return;
             }
         }
-
-        self.connected.entry(peer).or_default().push(connection);
+        
+        self.connected.entry(peer).or_default().push(conn_entry);
     }
 }
 
@@ -1071,5 +1103,58 @@ impl Connection {
             pending_outbound_responses: Default::default(),
             pending_inbound_responses: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_relayed_direct_address() {
+        let direct_addr: Multiaddr = "/ip4/127.0.0.1/tcp/1234".parse().unwrap();
+        assert!(!direct_addr.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_circuit_address() {
+        let relay_addr: Multiaddr = "/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWGzBRs8WVcMaEXGWwsvFSfJKYphwM6ojrPanuJfup1xFz".parse().unwrap();
+        assert!(relay_addr.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_none_address() {
+        let none_addr: Option<Multiaddr> = None;
+        assert!(!none_addr.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_some_direct_address() {
+        let some_direct: Option<Multiaddr> = Some("/ip4/127.0.0.1/tcp/1234".parse().unwrap());
+        assert!(!some_direct.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_some_circuit_address() {
+        let some_relay: Option<Multiaddr> = Some("/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWGzBRs8WVcMaEXGWwsvFSfJKYphwM6ojrPanuJfup1xFz".parse().unwrap());
+        assert!(some_relay.is_relayed());
+    }
+
+    #[test]
+    fn test_config_default_allows_relay() {
+        let cfg = Config::default();
+        assert!(cfg.allow_relay_for_requests, "Default config should allow relay connections");
+    }
+
+    #[test]
+    fn test_config_disable_relay() {
+        let cfg = Config::default().with_relay_for_requests(false);
+        assert!(!cfg.allow_relay_for_requests);
+    }
+
+    #[test]
+    fn test_config_enable_relay() {
+        let cfg = Config::default().with_relay_for_requests(true);
+        assert!(cfg.allow_relay_for_requests);
     }
 }
