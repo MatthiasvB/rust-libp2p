@@ -781,18 +781,19 @@ where
         connection_id: ConnectionId,
         remote_address: Option<Multiaddr>,
     ) {
-        let conn_entry = Connection::new(connection_id, remote_address.clone());
+        // Determine relay status before consuming the address
+        let is_relay_conn = remote_address.is_relayed();
+        let conn_entry = Connection::new(connection_id, remote_address);
         
         // Always register the connection for proper state tracking.
         // Only preload pending requests based on relay policy configuration.
-        let is_relay_conn = remote_address.is_relayed();
         let should_preload = self.config.allow_relay_for_requests || !is_relay_conn;
         
         if should_preload {
             if let Some(queued_requests) = self.pending_outbound_requests.remove(&peer) {
                 let conns = self.connected.entry(peer).or_default();
                 conns.push(conn_entry);
-                let conn_ref = conns.last_mut().expect("just pushed");
+                let conn_ref = conns.last_mut().expect("connection was just added to the vector");
                 for req in queued_requests {
                     conn_ref.pending_outbound_responses.insert(req.request_id);
                     handler.on_behaviour_event(req);
