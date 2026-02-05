@@ -279,6 +279,8 @@ where
                     // Only send addresses that belong to this interface.
                     // This prevents advertising loopback or other interface addresses
                     // to peers that can't reach them.
+                    // Note: We collect into a Vec because build_query_response requires
+                    // an ExactSizeIterator, which Filter doesn't implement.
                     let iface_ip = this.addr;
                     let relevant_addrs: Vec<_> = this
                         .listen_addresses
