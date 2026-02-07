@@ -87,30 +87,81 @@ impl Behaviour {
     }
 }
 
+/// Events emitted by the rendezvous **server** [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The rendezvous server maintains a registry of peer registrations organized by namespace.
+/// Remote peers can register themselves, discover other peers, and unregister. These events
+/// inform the application about activity on the server.
+///
+/// All events are informational — the server behaviour handles requests automatically.
+/// The application does not need to take action unless it wants to log, monitor, or
+/// apply custom policies.
+///
+/// # Event Lifecycle
+///
+/// - **Registration**: A peer registers → [`Event::PeerRegistered`].
+///   A registration is declined → [`Event::PeerNotRegistered`].
+/// - **Discovery**: A peer discovers → [`Event::DiscoverServed`].
+///   A discovery request fails → [`Event::DiscoverNotServed`].
+/// - **Unregistration**: A peer unregisters → [`Event::PeerUnregistered`].
+/// - **Expiration**: A registration's TTL expires → [`Event::RegistrationExpired`].
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
-    /// We successfully served a discover request from a peer.
+    /// A discovery request from a peer was successfully served.
+    ///
+    /// The server returned a list of matching registrations to the enquiring peer.
     DiscoverServed {
+        /// The peer that requested discovery.
         enquirer: PeerId,
+        /// The registrations that were returned to the enquirer.
         registrations: Vec<Registration>,
     },
-    /// We failed to serve a discover request for a peer.
-    DiscoverNotServed { enquirer: PeerId, error: ErrorCode },
-    /// A peer successfully registered with us.
-    PeerRegistered {
-        peer: PeerId,
-        registration: Registration,
-    },
-    /// We declined a registration from a peer.
-    PeerNotRegistered {
-        peer: PeerId,
-        namespace: Namespace,
+    /// A discovery request from a peer could not be served.
+    ///
+    /// This may occur if the requested namespace is invalid or the server encountered
+    /// an internal error.
+    DiscoverNotServed {
+        /// The peer whose discovery request failed.
+        enquirer: PeerId,
+        /// The error code describing why the request could not be served.
         error: ErrorCode,
     },
-    /// A peer successfully unregistered with us.
-    PeerUnregistered { peer: PeerId, namespace: Namespace },
-    /// A registration from a peer expired.
+    /// A peer successfully registered with this server.
+    ///
+    /// The peer is now discoverable by other peers querying the same namespace.
+    PeerRegistered {
+        /// The peer that registered.
+        peer: PeerId,
+        /// The registration details, including namespace, addresses, and TTL.
+        registration: Registration,
+    },
+    /// A peer's registration was declined by this server.
+    ///
+    /// This may occur if the namespace is invalid, the server is at capacity,
+    /// or the requested TTL is out of range.
+    PeerNotRegistered {
+        /// The peer whose registration was declined.
+        peer: PeerId,
+        /// The namespace the peer attempted to register under.
+        namespace: Namespace,
+        /// The error code describing why the registration was declined.
+        error: ErrorCode,
+    },
+    /// A peer successfully unregistered from this server.
+    ///
+    /// The peer is no longer discoverable under the specified namespace.
+    PeerUnregistered {
+        /// The peer that unregistered.
+        peer: PeerId,
+        /// The namespace from which the peer unregistered.
+        namespace: Namespace,
+    },
+    /// A registration has expired due to its TTL elapsing.
+    ///
+    /// The peer is no longer discoverable under the registration's namespace.
+    /// If the peer is still active, it will need to re-register.
     RegistrationExpired(Registration),
 }
 

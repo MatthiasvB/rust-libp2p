@@ -530,25 +530,49 @@ impl From<()> for InnerMessage {
     }
 }
 
-/// Event that can happen on the floodsub behaviour.
+/// Events emitted by the Floodsub [`Floodsub`] behaviour to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// Floodsub is a simple pubsub protocol where messages are flooded to all peers subscribed
+/// to a topic. Unlike gossipsub, floodsub does not use mesh routing or gossip — every
+/// message is forwarded to all connected subscribers.
+///
+/// **Note**: Floodsub is a basic protocol primarily suitable for small networks. For
+/// production use, consider [`gossipsub`](libp2p_gossipsub) which is more efficient and
+/// provides better scalability.
+///
+/// # Event Lifecycle
+///
+/// - [`FloodsubEvent::Message`]: A message was received on a subscribed topic.
+/// - [`FloodsubEvent::Subscribed`]: A connected peer subscribed to a topic.
+/// - [`FloodsubEvent::Unsubscribed`]: A connected peer unsubscribed from a topic.
 #[derive(Debug)]
 pub enum FloodsubEvent {
-    /// A message has been received.
+    /// A message has been received on a subscribed topic.
+    ///
+    /// Unlike gossipsub, floodsub does not deduplicate messages — the same message may
+    /// be received multiple times if multiple peers forward it.
     Message(FloodsubMessage),
 
-    /// A remote subscribed to a topic.
+    /// A connected peer subscribed to a topic.
+    ///
+    /// Emitted when a directly connected peer announces interest in a topic. Messages
+    /// published to this topic will be forwarded to the peer.
     Subscribed {
-        /// Remote that has subscribed.
+        /// The peer that subscribed.
         peer_id: PeerId,
-        /// The topic it has subscribed to.
+        /// The topic the peer subscribed to.
         topic: Topic,
     },
 
-    /// A remote unsubscribed from a topic.
+    /// A connected peer unsubscribed from a topic.
+    ///
+    /// Emitted when a directly connected peer announces it is no longer interested in
+    /// a topic. Messages published to this topic will no longer be forwarded to the peer.
     Unsubscribed {
-        /// Remote that has unsubscribed.
+        /// The peer that unsubscribed.
         peer_id: PeerId,
-        /// The topic it has subscribed from.
+        /// The topic the peer unsubscribed from.
         topic: Topic,
     },
 }

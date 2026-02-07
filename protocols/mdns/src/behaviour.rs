@@ -422,15 +422,45 @@ where
     }
 }
 
-/// Event that can be produced by the `Mdns` behaviour.
+/// Events emitted by the mDNS [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// mDNS (multicast DNS) is a protocol for discovering peers on the local network without
+/// requiring a central server. The behaviour automatically discovers peers on the same
+/// LAN subnet and reports them through these events.
+///
+/// # Event Lifecycle
+///
+/// 1. [`Event::Discovered`]: Emitted when one or more new peers are discovered on the
+///    local network. Each entry contains the peer's ID and a multiaddr for reaching it.
+///    This event is emitted both on initial discovery and when a peer re-announces itself.
+///
+/// 2. [`Event::Expired`]: Emitted when a previously discovered peer's mDNS record expires.
+///    Each mDNS record has a TTL; if the peer does not re-announce before the TTL expires,
+///    it is removed from the discovered set and reported as expired.
+///
+/// # Recommended Action
+///
+/// - **`Discovered`**: Add the discovered addresses to your address book or dial the peers.
+/// - **`Expired`**: Optionally remove the addresses from your address book. Note that the
+///   peer may still be reachable — the expiration only means the mDNS announcement has
+///   lapsed.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// Discovered nodes through mDNS.
+    /// One or more peers have been discovered on the local network via mDNS.
+    ///
+    /// Each entry is a `(PeerId, Multiaddr)` pair representing a discovered peer and
+    /// one of its addresses. A single peer may appear multiple times with different
+    /// addresses.
     Discovered(Vec<(PeerId, Multiaddr)>),
 
-    /// The given combinations of `PeerId` and `Multiaddr` have expired.
+    /// Previously discovered peer addresses have expired.
     ///
-    /// Each discovered record has a time-to-live. When this TTL expires and the address hasn't
-    /// been refreshed, we remove it from the list and emit it as an `Expired` event.
+    /// Each discovered mDNS record has a time-to-live (TTL). When this TTL expires and the
+    /// address hasn't been refreshed by a new mDNS announcement, the address is removed
+    /// from the discovered set and reported here.
+    ///
+    /// Note: Expiration does not necessarily mean the peer is offline — it only means the
+    /// mDNS announcement was not renewed in time.
     Expired(Vec<(PeerId, Multiaddr)>),
 }

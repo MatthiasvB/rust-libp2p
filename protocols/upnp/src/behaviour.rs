@@ -137,16 +137,56 @@ enum GatewayState {
     NonRoutableGateway(IpAddr),
 }
 
-/// The event produced by `Behaviour`.
+/// Events emitted by the UPnP [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// UPnP (Universal Plug and Play) is used to automatically configure port forwarding on
+/// a local network gateway (router). This enables the local node to be reachable from the
+/// public internet without manual router configuration.
+///
+/// # Event Lifecycle
+///
+/// 1. The behaviour discovers the local IGD (Internet Gateway Device) gateway.
+///    - If no gateway is found: [`Event::GatewayNotFound`] is emitted.
+///    - If the gateway is behind another NAT: [`Event::NonRoutableGateway`] is emitted.
+///
+/// 2. For each listen address, the behaviour requests a port mapping on the gateway.
+///    - **On success**: [`Event::NewExternalAddr`] is emitted with the externally reachable
+///      address. Port mappings are automatically renewed before they expire.
+///    - **On renewal failure**: [`Event::ExpiredExternalAddr`] is emitted, indicating the
+///      address is no longer externally reachable.
+///
+/// # Recommended Action
+///
+/// - **`NewExternalAddr`**: The address can be shared with other peers for direct
+///   connectivity. The swarm automatically registers it as an external address.
+/// - **`ExpiredExternalAddr`**: The address is no longer valid. Stop advertising it.
+/// - **`GatewayNotFound` / `NonRoutableGateway`**: UPnP is not available. The application
+///   may need to use alternative NAT traversal (relay, hole-punching) or manual port
+///   forwarding.
 #[derive(Debug)]
 pub enum Event {
-    /// The multiaddress is reachable externally.
+    /// A new external address has been successfully mapped on the gateway.
+    ///
+    /// The contained multiaddr is reachable from the public internet. It will remain
+    /// valid as long as the port mapping is renewed (which the behaviour does automatically).
     NewExternalAddr(Multiaddr),
-    /// The renewal of the multiaddress on the gateway failed.
+    /// A previously mapped external address could not be renewed on the gateway.
+    ///
+    /// The port mapping has expired and the address is no longer externally reachable.
+    /// This may happen if the gateway is rebooted, the lease expires, or the mapping
+    /// is removed by another application.
     ExpiredExternalAddr(Multiaddr),
-    /// The IGD gateway was not found.
+    /// No IGD-compatible gateway was found on the local network.
+    ///
+    /// UPnP port forwarding is not available. The node will not be directly reachable
+    /// from the public internet via UPnP.
     GatewayNotFound,
-    /// The Gateway is not exposed directly to the public network.
+    /// A gateway was found but it is not directly connected to the public internet.
+    ///
+    /// This typically means the gateway is behind another NAT (double-NAT), making
+    /// UPnP port forwarding ineffective. The mapped port on the inner gateway does
+    /// not translate to public reachability.
     NonRoutableGateway,
 }
 
