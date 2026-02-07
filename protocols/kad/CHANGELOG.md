@@ -1,5 +1,6 @@
 ## 0.47.0
 
+- Add `Behaviour::cancel_query` to allow cancelling running queries.
 - Expose a kad query facility allowing specify num_results dynamicaly.
   See [PR 5555](https://github.com/libp2p/rust-libp2p/pull/5555).
 - Add `mode` getter on `Behaviour`.
