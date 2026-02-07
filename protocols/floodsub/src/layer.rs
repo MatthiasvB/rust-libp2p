@@ -538,7 +538,7 @@ impl From<()> for InnerMessage {
 /// message is forwarded to all connected subscribers.
 ///
 /// **Note**: Floodsub is a basic protocol primarily suitable for small networks. For
-/// production use, consider [`gossipsub`](libp2p_gossipsub) which is more efficient and
+/// production use, consider gossipsub which is more efficient and
 /// provides better scalability.
 ///
 /// # Event Lifecycle
