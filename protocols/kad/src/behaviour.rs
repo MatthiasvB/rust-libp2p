@@ -555,6 +555,17 @@ where
         })
     }
 
+    /// Cancels a running query by removing it from the query pool.
+    ///
+    /// This immediately stops the query and no further progress events
+    /// will be emitted for it.
+    ///
+    /// Returns `true` if the query was found and cancelled,
+    /// `false` if no query with the given ID was found.
+    pub fn cancel_query(&mut self, id: &QueryId) -> bool {
+        self.queries.remove(id).is_some()
+    }
+
     /// Adds a known listen address of a peer participating in the DHT to the
     /// routing table.
     ///
