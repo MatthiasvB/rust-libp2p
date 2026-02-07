@@ -1623,6 +1623,25 @@ fn get_providers_limit_n_5() {
     get_providers_limit::<5>();
 }
 
+#[test]
+fn cancel_query() {
+    fn prop(key: record::Key) {
+        let (_, mut swarm) = build_node();
+
+        // Start a query and verify it exists.
+        let query_id = swarm.behaviour_mut().get_providers(key);
+        assert!(swarm.behaviour_mut().query(&query_id).is_some());
+
+        // Cancel it and verify it was removed.
+        assert!(swarm.behaviour_mut().cancel_query(&query_id));
+        assert!(swarm.behaviour_mut().query(&query_id).is_none());
+
+        // Cancelling again should return false.
+        assert!(!swarm.behaviour_mut().cancel_query(&query_id));
+    }
+    QuickCheck::new().tests(10).quickcheck(prop as fn(_))
+}
+
 // Test that nodes respond with K amount of peers even when replication factor is set lower than K.
 #[test]
 fn get_closest_peers_should_return_up_to_k_peers() {
