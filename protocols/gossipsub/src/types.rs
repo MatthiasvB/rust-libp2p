@@ -33,19 +33,28 @@ use web_time::Instant;
 
 use crate::{rpc::Sender, rpc_proto::proto, TopicHash};
 
-/// Messages that have expired while attempting to be sent to a peer.
+/// A breakdown of messages that failed to be delivered to a slow peer.
+///
+/// This struct is included in [`Event::SlowPeer`](crate::Event::SlowPeer) events and provides
+/// a detailed accounting of which types of messages were dropped for a particular peer
+/// during a heartbeat interval. Each field counts a distinct failure category.
+///
+/// Use [`FailedMessages::total`] or [`FailedMessages::total_queue_full`] for aggregate counts.
 #[derive(Clone, Debug, Default)]
 pub struct FailedMessages {
-    /// The number of publish messages that failed to be published in a heartbeat.
+    /// The number of locally published messages that could not be sent to the peer.
+    /// These are messages the local application published via [`Behaviour::publish`](crate::Behaviour::publish).
     pub publish: usize,
-    /// The number of forward messages that failed to be published in a heartbeat.
+    /// The number of messages forwarded from other peers that could not be relayed
+    /// to this peer.
     pub forward: usize,
-    /// The number of messages that were failed to be sent to the priority queue as it was full.
+    /// The number of messages that could not be added to the priority send queue
+    /// because it was full.
     pub priority: usize,
-    /// The number of messages that were failed to be sent to the non-priority queue as it was
-    /// full.
+    /// The number of messages that could not be added to the non-priority send queue
+    /// because it was full.
     pub non_priority: usize,
-    /// The number of messages that timed out and could not be sent.
+    /// The number of messages that timed out waiting to be sent to the peer.
     pub timeout: usize,
 }
 

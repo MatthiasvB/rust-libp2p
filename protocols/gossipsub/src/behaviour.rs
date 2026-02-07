@@ -124,40 +124,95 @@ impl MessageAuthenticity {
     }
 }
 
-/// Event that can be emitted by the gossipsub behaviour.
+/// Events emitted by the [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// Gossipsub is a pubsub protocol: peers subscribe to topics and receive messages published
+/// to those topics. These events inform the application about incoming messages, subscription
+/// changes, and peer issues.
+///
+/// # Event Lifecycle
+///
+/// - **[`Event::Message`]**: Emitted when a new, valid message arrives on a subscribed topic.
+///   This is the primary event for receiving data. If message validation is configured
+///   (see [`MessageAuthenticity`]), only valid messages are delivered.
+/// - **[`Event::Subscribed`] / [`Event::Unsubscribed`]**: Emitted when a remote peer joins or
+///   leaves a topic. Useful for tracking topic membership.
+/// - **[`Event::GossipsubNotSupported`]**: Emitted when a connected peer does not support the
+///   gossipsub protocol, allowing the application to handle incompatible peers.
+/// - **[`Event::SlowPeer`]**: Emitted when a peer's message queue fills up, indicating the
+///   peer cannot keep up with the message rate. The application may choose to disconnect or
+///   deprioritize such peers.
 #[derive(Debug)]
 pub enum Event {
-    /// A message has been received.
+    /// A new message has been received on a subscribed topic.
+    ///
+    /// This event is emitted once per unique message. Gossipsub deduplicates messages
+    /// by their [`MessageId`], so the same message will not be delivered twice even if
+    /// received from multiple peers.
+    ///
+    /// If message validation is enabled (see [`ValidationMode`]), only messages that
+    /// pass validation are delivered here.
+    ///
+    /// # Recommended Action
+    ///
+    /// Process the message content. If extended validation is configured
+    /// ([`ValidationMode::Strict`] or [`ValidationMode::Permissive`]), the application
+    /// must call [`Behaviour::report_message_validation_result`] to accept or reject
+    /// the message, which determines whether it is further propagated to other peers.
     Message {
-        /// The peer that forwarded us this message.
+        /// The peer that forwarded this message to the local node. Note that this may
+        /// not be the original author of the message — in gossipsub, messages are relayed
+        /// through multiple hops.
         propagation_source: PeerId,
-        /// The [`MessageId`] of the message. This should be referenced by the application when
-        /// validating a message (if required).
+        /// The unique identifier of this message. Reference this ID when calling
+        /// [`Behaviour::report_message_validation_result`] if validation is required.
         message_id: MessageId,
-        /// The decompressed message itself.
+        /// The decompressed message content, including the topic, data payload,
+        /// and optional source peer ID and sequence number.
         message: Message,
     },
-    /// A remote subscribed to a topic.
+    /// A remote peer subscribed to a topic.
+    ///
+    /// Emitted when a directly connected peer sends a subscription control message for a
+    /// topic. This is informational and can be used to track which peers are interested
+    /// in which topics.
     Subscribed {
-        /// Remote that has subscribed.
+        /// The peer that subscribed to the topic.
         peer_id: PeerId,
-        /// The topic it has subscribed to.
+        /// The topic the peer subscribed to.
         topic: TopicHash,
     },
-    /// A remote unsubscribed from a topic.
+    /// A remote peer unsubscribed from a topic.
+    ///
+    /// Emitted when a directly connected peer sends an unsubscription control message.
+    /// After this event, messages for the topic will no longer be forwarded to this peer.
     Unsubscribed {
-        /// Remote that has unsubscribed.
+        /// The peer that unsubscribed from the topic.
         peer_id: PeerId,
-        /// The topic it has subscribed from.
+        /// The topic the peer unsubscribed from.
         topic: TopicHash,
     },
-    /// A peer that does not support gossipsub has connected.
+    /// A connected peer does not support the gossipsub protocol.
+    ///
+    /// Emitted during protocol negotiation when a peer cannot speak gossipsub.
+    /// The application may choose to disconnect such peers or simply ignore this event.
     GossipsubNotSupported { peer_id: PeerId },
-    /// A peer is not able to download messages in time.
+    /// A peer is unable to receive messages fast enough.
+    ///
+    /// Emitted when messages to a peer are dropped because the peer's send queue is full
+    /// or messages have timed out. This indicates the peer cannot keep up with the current
+    /// message throughput. Inspect the [`FailedMessages`] struct to see which types of
+    /// messages (publish, forward, priority, etc.) are being dropped.
+    ///
+    /// # Recommended Action
+    ///
+    /// Consider disconnecting slow peers to avoid wasting bandwidth, or reducing the
+    /// message rate for the affected topics.
     SlowPeer {
-        /// The peer_id
+        /// The peer that is falling behind.
         peer_id: PeerId,
-        /// The types and amounts of failed messages that are occurring for this peer.
+        /// A breakdown of the types and counts of messages that were dropped for this peer.
         failed_messages: FailedMessages,
     },
 }

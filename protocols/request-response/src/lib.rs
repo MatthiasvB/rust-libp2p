@@ -97,100 +97,183 @@ use smallvec::SmallVec;
 
 use crate::handler::OutboundMessage;
 
-/// An inbound request or response.
+/// An inbound request or response received from a remote peer.
+///
+/// This enum distinguishes between incoming requests (which expect a response) and
+/// incoming responses (which complete an earlier outbound request).
+///
+/// Delivered inside [`Event::Message`].
 #[derive(Debug)]
 pub enum Message<TRequest, TResponse, TChannelResponse = TResponse> {
-    /// A request message.
+    /// An inbound request from a remote peer that expects a response.
+    ///
+    /// The application **must** send a response using [`Behaviour::send_response`]
+    /// with the provided [`ResponseChannel`]. If the channel is dropped without sending
+    /// a response, an [`Event::InboundFailure`] with [`InboundFailure::ResponseOmission`]
+    /// is emitted, and the remote peer will experience an [`OutboundFailure::Io`] or
+    /// [`OutboundFailure::ConnectionClosed`].
     Request {
-        /// The ID of this request.
+        /// A locally unique identifier for this inbound request.
         request_id: InboundRequestId,
-        /// The request message.
+        /// The request payload sent by the remote peer.
         request: TRequest,
-        /// The channel waiting for the response.
+        /// The channel through which the response must be sent.
         ///
-        /// If this channel is dropped instead of being used to send a response
-        /// via [`Behaviour::send_response`], a [`Event::InboundFailure`]
-        /// with [`InboundFailure::ResponseOmission`] is emitted.
+        /// Pass this to [`Behaviour::send_response`] to reply to the request.
+        /// If this channel is dropped instead of being used to send a response,
+        /// an [`Event::InboundFailure`] with [`InboundFailure::ResponseOmission`]
+        /// is emitted.
         channel: ResponseChannel<TChannelResponse>,
     },
-    /// A response message.
+    /// A response to an outbound request previously sent via [`Behaviour::send_request`].
+    ///
+    /// The `request_id` corresponds to the [`OutboundRequestId`] returned by
+    /// [`Behaviour::send_request`], allowing the application to match responses to
+    /// their originating requests.
     Response {
-        /// The ID of the request that produced this response.
-        ///
-        /// See [`Behaviour::send_request`].
+        /// The ID of the outbound request that produced this response, as returned by
+        /// [`Behaviour::send_request`].
         request_id: OutboundRequestId,
-        /// The response message.
+        /// The response payload sent by the remote peer.
         response: TResponse,
     },
 }
 
-/// The events emitted by a request-response [`Behaviour`].
+/// Events emitted by the request-response [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The request-response protocol implements a simple pattern where one peer sends a
+/// request and another peer sends back a response. These events inform the application
+/// about incoming messages, delivery confirmations, and failures.
+///
+/// # Event Lifecycle
+///
+/// ## Outbound Request Flow (initiated by the local node)
+///
+/// 1. The application calls [`Behaviour::send_request`], receiving an [`OutboundRequestId`].
+/// 2. **On success**: An [`Event::Message`] with [`Message::Response`] is emitted, containing
+///    the remote peer's response.
+/// 3. **On failure**: An [`Event::OutboundFailure`] is emitted with details about what went
+///    wrong (dial failure, timeout, connection closed, or unsupported protocol).
+///
+/// ## Inbound Request Flow (initiated by a remote peer)
+///
+/// 1. An [`Event::Message`] with [`Message::Request`] is emitted, containing the request
+///    and a [`ResponseChannel`].
+/// 2. The application processes the request and sends a response via
+///    [`Behaviour::send_response`] using the provided channel.
+/// 3. **On success**: An [`Event::ResponseSent`] is emitted, confirming the response was
+///    flushed to the transport.
+/// 4. **On failure**: An [`Event::InboundFailure`] is emitted if the response could not
+///    be sent (timeout, connection closed, or the response channel was dropped).
 #[derive(Debug)]
 pub enum Event<TRequest, TResponse, TChannelResponse = TResponse> {
-    /// An incoming message (request or response).
+    /// An incoming message (request or response) has been received from a peer.
+    ///
+    /// Match on the inner [`Message`] to determine whether this is an inbound request
+    /// (which requires a response) or a response to a previously sent outbound request.
     Message {
         /// The peer who sent the message.
         peer: PeerId,
-        /// The connection used.
+        /// The connection on which the message was received.
         connection_id: ConnectionId,
-        /// The incoming message.
+        /// The incoming message. See [`Message::Request`] and [`Message::Response`].
         message: Message<TRequest, TResponse, TChannelResponse>,
     },
-    /// An outbound request failed.
+    /// An outbound request (sent via [`Behaviour::send_request`]) has failed.
+    ///
+    /// The `request_id` corresponds to the [`OutboundRequestId`] returned by
+    /// [`Behaviour::send_request`]. After this event, no [`Message::Response`] will
+    /// be received for this request.
+    ///
+    /// # Difference from `InboundFailure`
+    ///
+    /// - `OutboundFailure`: Failure when *sending* a request and *receiving* its response.
+    /// - [`Event::InboundFailure`]: Failure when *receiving* a request and *sending* its
+    ///   response.
     OutboundFailure {
         /// The peer to whom the request was sent.
         peer: PeerId,
-        /// The connection used.
+        /// The connection that was used (or attempted).
         connection_id: ConnectionId,
-        /// The (local) ID of the failed request.
+        /// The ID of the failed outbound request, as returned by
+        /// [`Behaviour::send_request`].
         request_id: OutboundRequestId,
-        /// The error that occurred.
+        /// The reason for the failure.
         error: OutboundFailure,
     },
-    /// An inbound request failed.
+    /// An inbound request from a remote peer has failed.
+    ///
+    /// This indicates that the local node could not process or respond to a request from
+    /// the remote peer. Possible causes include timeouts, connection closures, protocol
+    /// mismatches, or the application dropping the [`ResponseChannel`] without sending
+    /// a response.
+    ///
+    /// # Difference from `OutboundFailure`
+    ///
+    /// - [`Event::OutboundFailure`]: Failure when *sending* a request and *receiving* its
+    ///   response.
+    /// - `InboundFailure`: Failure when *receiving* a request and *sending* its response.
     InboundFailure {
         /// The peer from whom the request was received.
         peer: PeerId,
-        /// The connection used.
+        /// The connection on which the request was received.
         connection_id: ConnectionId,
         /// The ID of the failed inbound request.
         request_id: InboundRequestId,
-        /// The error that occurred.
+        /// The reason for the failure.
         error: InboundFailure,
     },
-    /// A response to an inbound request has been sent.
+    /// A response to an inbound request has been successfully sent.
     ///
-    /// When this event is received, the response has been flushed on
-    /// the underlying transport connection.
+    /// This event confirms that the response has been flushed on the underlying
+    /// transport connection. It is emitted after a successful call to
+    /// [`Behaviour::send_response`].
+    ///
+    /// This is a confirmation event — no action is required, but it may be useful
+    /// for logging, metrics, or cleanup of per-request state.
     ResponseSent {
         /// The peer to whom the response was sent.
         peer: PeerId,
-        /// The connection used.
+        /// The connection on which the response was sent.
         connection_id: ConnectionId,
         /// The ID of the inbound request whose response was sent.
         request_id: InboundRequestId,
     },
 }
 
-/// Possible failures occurring in the context of sending
-/// an outbound request and receiving the response.
+/// Possible failures occurring in the context of sending an outbound request and
+/// receiving the response.
+///
+/// Returned inside [`Event::OutboundFailure`]. Each variant represents a different
+/// failure mode. After receiving an `OutboundFailure`, no response will be delivered
+/// for the corresponding request.
 #[derive(Debug)]
 pub enum OutboundFailure {
-    /// The request could not be sent because a dialing attempt failed.
+    /// The request could not be sent because the dial attempt to the peer failed.
+    ///
+    /// This occurs when there is no existing connection to the peer and a new connection
+    /// could not be established (e.g. the peer is unreachable or all known addresses failed).
     DialFailure,
     /// The request timed out before a response was received.
     ///
-    /// It is not known whether the request may have been
-    /// received (and processed) by the remote peer.
+    /// The timeout is configured via [`Config::with_request_timeout`].
+    /// It is not known whether the request was received (and possibly processed) by the
+    /// remote peer.
     Timeout,
-    /// The connection closed before a response was received.
+    /// The connection was closed before a response was received.
     ///
-    /// It is not known whether the request may have been
-    /// received (and processed) by the remote peer.
+    /// The request may or may not have been received by the remote peer before the
+    /// connection closed.
     ConnectionClosed,
-    /// The remote supports none of the requested protocols.
+    /// The remote peer does not support any of the requested protocols.
+    ///
+    /// This occurs during protocol negotiation when the remote peer's supported
+    /// protocols do not overlap with the protocols configured in this behaviour.
     UnsupportedProtocols,
-    /// An IO failure happened on an outbound stream.
+    /// An I/O error occurred on the outbound stream.
+    ///
+    /// This may occur during sending the request or reading the response.
     Io(io::Error),
 }
 
@@ -212,25 +295,40 @@ impl fmt::Display for OutboundFailure {
 
 impl std::error::Error for OutboundFailure {}
 
-/// Possible failures occurring in the context of receiving an
-/// inbound request and sending a response.
+/// Possible failures occurring in the context of receiving an inbound request and
+/// sending a response.
+///
+/// Returned inside [`Event::InboundFailure`]. Each variant represents a different
+/// failure mode that prevented the local node from successfully handling an inbound
+/// request.
 #[derive(Debug)]
 pub enum InboundFailure {
-    /// The inbound request timed out, either while reading the
-    /// incoming request or before a response is sent, e.g. if
-    /// [`Behaviour::send_response`] is not called in a
-    /// timely manner.
+    /// The inbound request timed out.
+    ///
+    /// This can happen either while reading the incoming request from the stream, or
+    /// because the application did not call [`Behaviour::send_response`] within the
+    /// configured timeout ([`Config::with_request_timeout`]).
     Timeout,
-    /// The connection closed before a response could be send.
+    /// The connection was closed before a response could be sent.
+    ///
+    /// The remote peer may have disconnected or the connection may have been dropped
+    /// for another reason before the application could respond.
     ConnectionClosed,
-    /// The local peer supports none of the protocols requested
-    /// by the remote.
+    /// The local peer does not support any of the protocols requested by the remote.
+    ///
+    /// This occurs during protocol negotiation when the remote peer requests a
+    /// protocol that this node is not configured to handle.
     UnsupportedProtocols,
-    /// The local peer failed to respond to an inbound request
-    /// due to the [`ResponseChannel`] being dropped instead of
-    /// being passed to [`Behaviour::send_response`].
+    /// The application dropped the [`ResponseChannel`] without sending a response.
+    ///
+    /// This occurs when the [`ResponseChannel`] provided in [`Message::Request`] is
+    /// dropped (e.g. goes out of scope) instead of being passed to
+    /// [`Behaviour::send_response`]. The remote peer will typically see a connection
+    /// error or timeout.
     ResponseOmission,
-    /// An IO failure happened on an inbound stream.
+    /// An I/O error occurred on the inbound stream.
+    ///
+    /// This may occur during reading the request or writing the response.
     Io(io::Error),
 }
 

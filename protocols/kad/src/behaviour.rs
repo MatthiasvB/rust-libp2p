@@ -2748,52 +2748,148 @@ pub struct PeerRecord {
 //////////////////////////////////////////////////////////////////////////////
 // Events
 
-/// The events produced by the `Kademlia` behaviour.
+/// The events produced by the Kademlia behaviour.
+///
+/// These events are emitted by [`Behaviour`] via the [`NetworkBehaviour`] trait and delivered
+/// to the application through [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// # Event Lifecycle
+///
+/// Events are generated in response to two broad categories of activity:
+///
+/// 1. **Inbound activity**: A remote peer sends a Kademlia protocol request to this node.
+///    These produce [`Event::InboundRequest`] events, which are purely informational and do
+///    not typically require a response from the application (the behaviour handles them
+///    automatically), unless record filtering is enabled via [`Config::set_record_filtering`].
+///
+/// 2. **Outbound queries**: The application initiates a query (e.g. via [`Behaviour::get_record`],
+///    [`Behaviour::put_record`], [`Behaviour::get_closest_peers`], [`Behaviour::get_providers`],
+///    [`Behaviour::start_providing`], or [`Behaviour::bootstrap`]). These produce one or more
+///    [`Event::OutboundQueryProgressed`] events as the query advances through the network. A query
+///    fans out across multiple peers, and each intermediate or final result is reported through this
+///    event. Use [`ProgressStep::last`] to determine when a query has completed.
+///
+/// 3. **Routing table changes**: As the DHT discovers, connects to, or loses peers, events such as
+///    [`Event::RoutingUpdated`], [`Event::UnroutablePeer`], [`Event::RoutablePeer`], and
+///    [`Event::PendingRoutablePeer`] inform the application about changes to the routing table.
+///
+/// # Difference Between Requests and Queries
+///
+/// A **request** is a single request-response exchange with one remote peer, while a **query** is
+/// a multi-step operation that fans out across multiple peers using the Kademlia iterative lookup
+/// algorithm. For example, [`Behaviour::get_record`] initiates a query that sends individual
+/// `GetRecord` requests to multiple peers.
 ///
 /// See [`NetworkBehaviour::poll`].
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
-    /// An inbound request has been received and handled.
+    /// A remote peer has sent a Kademlia request to this node, and it has been handled.
+    ///
+    /// This is a **notification-only** event: the behaviour has already processed and responded
+    /// to the request. The application does not need to take any action unless record filtering
+    /// is enabled (see [`StoreInserts`] and [`Config::set_record_filtering`]), in which case
+    /// the application must inspect [`InboundRequest::PutRecord`] or [`InboundRequest::AddProvider`]
+    /// and decide whether to insert the record into the local store.
+    ///
+    /// This event is distinct from [`Event::OutboundQueryProgressed`], which reports progress
+    /// on queries *initiated by the local node*. `InboundRequest` events are triggered by
+    /// *remote* peers contacting this node.
     // Note on the difference between 'request' and 'query': A request is a
     // single request-response style exchange with a single remote peer. A query
     // is made of multiple requests across multiple remote peers.
     InboundRequest { request: InboundRequest },
 
-    /// An outbound query has made progress.
+    /// An outbound query initiated by the local node has made progress.
+    ///
+    /// This event is emitted one or more times for each query started via methods like
+    /// [`Behaviour::get_record`], [`Behaviour::put_record`], [`Behaviour::get_closest_peers`],
+    /// [`Behaviour::get_providers`], [`Behaviour::start_providing`], or [`Behaviour::bootstrap`].
+    ///
+    /// # Multiple Events per Query
+    ///
+    /// A single query can produce multiple `OutboundQueryProgressed` events. For example,
+    /// [`Behaviour::get_record`] may emit a [`GetRecordOk::FoundRecord`] for each peer that
+    /// returns the record, followed by a final [`GetRecordOk::FinishedWithNoAdditionalRecord`].
+    /// Use [`ProgressStep::last`] to determine whether the query is complete.
+    ///
+    /// # Typical Handling
+    ///
+    /// Match on the [`QueryResult`] inside `result` to determine which type of query this
+    /// event belongs to, then handle the `Ok` or `Err` variant accordingly. The `id` field
+    /// lets you correlate this event with the [`QueryId`] returned by the method that started
+    /// the query.
     OutboundQueryProgressed {
-        /// The ID of the query that finished.
+        /// The ID of the query that produced this event, as returned by methods like
+        /// [`Behaviour::get_record`] or [`Behaviour::bootstrap`]. Use this to correlate
+        /// events with the queries you initiated.
         id: QueryId,
-        /// The intermediate result of the query.
+        /// The intermediate or final result of the query. Match on the [`QueryResult`]
+        /// variant to determine the query type (e.g. `GetRecord`, `PutRecord`, etc.) and
+        /// inspect the inner `Ok` / `Err` value.
         result: QueryResult,
-        /// Execution statistics from the query.
+        /// Execution statistics from the query, including the number of requests made,
+        /// successes, failures, and elapsed time.
         stats: QueryStats,
-        /// Indicates which event this is, if therer are multiple responses for a single query.
+        /// Tracks the progress of multi-event queries. The `count` field indicates
+        /// which event this is (1-indexed), and `last` is `true` when this is the
+        /// final event for the query. Always check `step.last` to know when a query
+        /// has fully completed.
         step: ProgressStep,
     },
 
-    /// The routing table has been updated with a new peer and / or
-    /// address, thereby possibly evicting another peer.
+    /// The routing table has been updated with a new peer and/or address, thereby possibly
+    /// evicting another peer.
+    ///
+    /// This event is emitted when a peer is successfully inserted or updated in the Kademlia
+    /// routing table (k-bucket). It may occur after a connection is established, after a
+    /// successful Kademlia query response, or after an explicit call to
+    /// [`Behaviour::add_address`].
+    ///
+    /// If `old_peer` is `Some`, a previously known peer was evicted from the routing table
+    /// to make room for the new peer.
+    ///
+    /// # Difference from `RoutablePeer` and `PendingRoutablePeer`
+    ///
+    /// - [`Event::RoutingUpdated`]: The peer *was* added/updated in the routing table.
+    /// - [`Event::RoutablePeer`]: The peer *could* be added but wasn't, because inserts are
+    ///   manual or the bucket is full.
+    /// - [`Event::PendingRoutablePeer`]: The peer is *pending* addition, waiting to see if
+    ///   a disconnected peer is unresponsive.
     RoutingUpdated {
         /// The ID of the peer that was added or updated.
         peer: PeerId,
-        /// Whether this is a new peer and was thus just added to the routing
-        /// table, or whether it is an existing peer who's addresses changed.
+        /// `true` if this peer was not previously in the routing table and was just added.
+        /// `false` if this peer was already present and only its addresses were updated.
         is_new_peer: bool,
         /// The full list of known addresses of `peer`.
         addresses: Addresses,
-        /// Returns the minimum inclusive and maximum inclusive distance for
-        /// the bucket of the peer.
+        /// The minimum inclusive and maximum inclusive [`Distance`] for
+        /// the k-bucket that this peer belongs to.
         bucket_range: (Distance, Distance),
         /// The ID of the peer that was evicted from the routing table to make
-        /// room for the new peer, if any.
+        /// room for the new peer, if any. When `None`, no peer was evicted.
         old_peer: Option<PeerId>,
     },
 
     /// A peer has connected for whom no listen address is known.
     ///
-    /// If the peer is to be added to the routing table, a known
-    /// listen address for the peer must be provided via [`Behaviour::add_address`].
+    /// This event occurs during connection establishment when the Kademlia behaviour observes
+    /// a new peer but has no known listen address for it. Without a listen address, the peer
+    /// cannot be added to the routing table because Kademlia needs routable addresses to
+    /// function correctly.
+    ///
+    /// # Recommended Action
+    ///
+    /// If the peer is to be added to the routing table, a known listen address must be
+    /// provided via [`Behaviour::add_address`]. If you do not need this peer in the routing
+    /// table, this event can be safely ignored.
+    ///
+    /// # Difference from `RoutablePeer`
+    ///
+    /// - `UnroutablePeer`: No listen address is known at all.
+    /// - [`Event::RoutablePeer`]: A listen address is known, but the peer was not inserted
+    ///   into the routing table for other reasons (e.g. manual inserts or full bucket).
     UnroutablePeer { peer: PeerId },
 
     /// A connection to a peer has been established for whom a listen address
@@ -2801,9 +2897,23 @@ pub enum Event {
     /// because [`BucketInserts::Manual`] is configured or because
     /// the corresponding bucket is full.
     ///
+    /// This event occurs during connection establishment when the Kademlia behaviour
+    /// has an address for the peer but cannot or will not automatically insert it into
+    /// the routing table.
+    ///
+    /// # Recommended Action
+    ///
     /// If the peer is to be included in the routing table, it must
-    /// must be explicitly added via [`Behaviour::add_address`], possibly after
-    /// removing another peer.
+    /// be explicitly added via [`Behaviour::add_address`], possibly after
+    /// removing another peer to make room.
+    ///
+    /// # Difference from `UnroutablePeer` and `PendingRoutablePeer`
+    ///
+    /// - [`Event::UnroutablePeer`]: No listen address is known at all.
+    /// - `RoutablePeer`: A listen address is known but the peer was not inserted due to
+    ///   manual insert mode or a full bucket.
+    /// - [`Event::PendingRoutablePeer`]: A listen address is known and the peer is pending
+    ///   insertion (waiting for a disconnected peer to be evicted).
     ///
     /// See [`Behaviour::kbucket`] for insight into the contents of
     /// the k-bucket of `peer`.
@@ -2814,27 +2924,74 @@ pub enum Event {
     /// if the least-recently disconnected peer is unresponsive, i.e. the peer
     /// may not make it into the routing table.
     ///
+    /// This event occurs when the k-bucket for this peer is full and the new peer
+    /// has been placed in a pending slot. The Kademlia protocol will attempt to contact
+    /// the least-recently disconnected peer in the bucket, and if that peer does not
+    /// respond, the pending peer will be inserted (producing a [`Event::RoutingUpdated`]
+    /// event).
+    ///
+    /// # Recommended Action
+    ///
     /// If the peer is to be unconditionally included in the routing table,
     /// it should be explicitly added via [`Behaviour::add_address`] after
     /// removing another peer.
+    ///
+    /// # Difference from `RoutablePeer`
+    ///
+    /// - [`Event::RoutablePeer`]: The peer was *not* inserted and is *not* pending.
+    /// - `PendingRoutablePeer`: The peer is *pending* insertion and may eventually be
+    ///   inserted automatically.
     ///
     /// See [`Behaviour::kbucket`] for insight into the contents of
     /// the k-bucket of `peer`.
     PendingRoutablePeer { peer: PeerId, address: Multiaddr },
 
-    /// This peer's mode has been updated automatically.
+    /// This peer's Kademlia mode has been updated automatically.
     ///
-    /// This happens in response to an external
-    /// address being added or removed.
+    /// The Kademlia mode determines whether this node acts as a **server** (responds to
+    /// incoming Kademlia requests from other peers) or a **client** (only initiates queries
+    /// but does not serve requests).
+    ///
+    /// This event is emitted when the mode changes automatically in response to an external
+    /// address being added or removed. When the node has a confirmed external address, it
+    /// typically switches to server mode; when the external address is lost, it may revert
+    /// to client mode.
+    ///
+    /// # Recommended Action
+    ///
+    /// This is informational. You may want to log mode changes or adjust application
+    /// behaviour based on whether the node is acting as a full DHT server or client-only.
     ModeChanged { new_mode: Mode },
 }
 
-/// Information about progress events.
+/// Tracks the progress of a multi-step [`Event::OutboundQueryProgressed`] sequence.
+///
+/// Some Kademlia queries produce multiple progress events before completing. For example,
+/// a [`Behaviour::get_record`] query may emit one [`GetRecordOk::FoundRecord`] for each
+/// peer that returns the record, followed by a final [`GetRecordOk::FinishedWithNoAdditionalRecord`].
+///
+/// # Fields
+///
+/// - `count`: A 1-indexed counter indicating which event in the sequence this is.
+/// - `last`: `true` when this is the final event for the query. After receiving an event
+///   where `last == true`, no more events will be emitted for this [`QueryId`].
+///
+/// # Typical Usage
+///
+/// ```ignore
+/// if step.last {
+///     // The query is complete — finalize processing.
+/// } else {
+///     // More results may follow — accumulate intermediate results.
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ProgressStep {
-    /// The index into the event
+    /// The 1-indexed position of this event in the sequence of progress events
+    /// for a given query.
     pub count: NonZeroUsize,
-    /// Is this the final event?
+    /// `true` if this is the final event for the query. No more
+    /// [`Event::OutboundQueryProgressed`] events with this [`QueryId`] will follow.
     pub last: bool,
 }
 
@@ -2860,30 +3017,62 @@ impl ProgressStep {
     }
 }
 
-/// Information about a received and handled inbound request.
+/// Information about a Kademlia request received from a remote peer and handled by this node.
+///
+/// These variants describe the type of inbound request that was processed. The behaviour
+/// has already sent a response to the remote peer. This event is informational unless
+/// record filtering is enabled (see [`StoreInserts`] and [`Config::set_record_filtering`]),
+/// in which case the application must inspect [`InboundRequest::PutRecord`] or
+/// [`InboundRequest::AddProvider`] to decide whether to store the record.
+///
+/// # Variants Overview
+///
+/// | Variant | Remote is asking | When it occurs |
+/// |---------|-----------------|----------------|
+/// | [`FindNode`](InboundRequest::FindNode) | "Who are the closest peers to this key?" | During peer discovery / routing table maintenance |
+/// | [`GetProvider`](InboundRequest::GetProvider) | "Who provides content for this key?" | When a peer looks up content providers |
+/// | [`AddProvider`](InboundRequest::AddProvider) | "I am a provider for this key" | When a peer announces itself as a provider |
+/// | [`GetRecord`](InboundRequest::GetRecord) | "Do you have the value for this key?" | During DHT record lookups |
+/// | [`PutRecord`](InboundRequest::PutRecord) | "Please store this record" | During DHT record storage / replication |
 #[derive(Debug, Clone)]
 pub enum InboundRequest {
-    /// Request for the list of nodes whose IDs are the closest to `key`.
+    /// A remote peer requested the list of nodes whose IDs are closest to a given key.
+    ///
+    /// This is the most fundamental Kademlia operation, used during iterative lookups and
+    /// routing table maintenance. The response (already sent) contains up to `k` closest
+    /// peers known to this node.
     FindNode { num_closer_peers: usize },
-    /// Same as `FindNode`, but should also return the entries of the local
-    /// providers list for this key.
+    /// A remote peer requested content providers for a given key, along with closer peers.
+    ///
+    /// Similar to [`FindNode`](InboundRequest::FindNode), but the response also includes
+    /// any peers known to this node that have announced themselves as providers for the key.
     GetProvider {
         num_closer_peers: usize,
         num_provider_peers: usize,
     },
-    /// A peer sent an add provider request.
-    /// If filtering [`StoreInserts::FilterBoth`] is enabled, the [`ProviderRecord`] is
-    /// included.
+    /// A remote peer announced itself as a provider for a given key.
     ///
-    /// See [`StoreInserts`] and [`Config::set_record_filtering`] for details..
+    /// When record filtering is enabled via [`StoreInserts::FilterBoth`], the
+    /// [`ProviderRecord`] is included so the application can decide whether to accept
+    /// and store the provider announcement. When filtering is not enabled, the provider
+    /// record is stored automatically and `record` is `None`.
+    ///
+    /// See [`StoreInserts`] and [`Config::set_record_filtering`] for details.
     AddProvider { record: Option<ProviderRecord> },
-    /// Request to retrieve a record.
+    /// A remote peer requested a record by key.
+    ///
+    /// The `present_locally` field indicates whether this node had the record in its
+    /// local store at the time of the request. `num_closer_peers` indicates how many
+    /// closer peers were included in the response regardless.
     GetRecord {
         num_closer_peers: usize,
         present_locally: bool,
     },
-    /// A peer sent a put record request.
-    /// If filtering [`StoreInserts::FilterBoth`] is enabled, the [`Record`] is included.
+    /// A remote peer asked this node to store a record.
+    ///
+    /// When record filtering is enabled via [`StoreInserts::FilterBoth`], the [`Record`]
+    /// is included so the application can validate and decide whether to store it. When
+    /// filtering is not enabled, the record is stored automatically and `record` is `None`.
     ///
     /// See [`StoreInserts`] and [`Config::set_record_filtering`].
     PutRecord {
@@ -2893,41 +3082,132 @@ pub enum InboundRequest {
     },
 }
 
-/// The results of Kademlia queries.
+/// The result of an outbound Kademlia query, delivered inside
+/// [`Event::OutboundQueryProgressed`].
+///
+/// Each variant wraps a `Result<..Ok, ..Error>` type corresponding to one of the query
+/// methods on [`Behaviour`]. Match on this enum to determine which kind of query produced
+/// the event, then inspect the inner `Ok` or `Err` to handle the result.
+///
+/// # Variants and Their Originating Methods
+///
+/// | Variant | Initiated by | Description |
+/// |---------|-------------|-------------|
+/// | [`Bootstrap`](QueryResult::Bootstrap) | [`Behaviour::bootstrap`] | Populates the routing table by querying peers closest to the local node's ID |
+/// | [`GetClosestPeers`](QueryResult::GetClosestPeers) | [`Behaviour::get_closest_peers`] | Finds the `k` closest peers to a given key |
+/// | [`GetProviders`](QueryResult::GetProviders) | [`Behaviour::get_providers`] | Discovers which peers provide content for a given key |
+/// | [`StartProviding`](QueryResult::StartProviding) | [`Behaviour::start_providing`] | Announces this node as a provider for a given key |
+/// | [`RepublishProvider`](QueryResult::RepublishProvider) | *(automatic)* | Periodically re-announces provider records to maintain them in the DHT |
+/// | [`GetRecord`](QueryResult::GetRecord) | [`Behaviour::get_record`] | Retrieves a value record from the DHT |
+/// | [`PutRecord`](QueryResult::PutRecord) | [`Behaviour::put_record`] | Stores a value record in the DHT |
+/// | [`RepublishRecord`](QueryResult::RepublishRecord) | *(automatic)* | Periodically re-publishes value records to maintain them in the DHT |
 #[derive(Debug, Clone)]
 pub enum QueryResult {
     /// The result of [`Behaviour::bootstrap`].
+    ///
+    /// Bootstrap populates the routing table by performing iterative lookups for the
+    /// local node's own ID and then for random keys in each k-bucket. Multiple
+    /// progress events may be emitted (one per bucket), with [`BootstrapOk::num_remaining`]
+    /// indicating how many buckets are left. The query is complete when `num_remaining == 0`
+    /// (and [`ProgressStep::last`] is `true`).
     Bootstrap(BootstrapResult),
 
     /// The result of [`Behaviour::get_closest_peers`].
+    ///
+    /// Returns the peers closest to a given key as determined by the Kademlia XOR distance
+    /// metric. This is a single-result query: one event is emitted when the iterative
+    /// lookup completes (or times out).
     GetClosestPeers(GetClosestPeersResult),
 
     /// The result of [`Behaviour::get_providers`].
+    ///
+    /// May emit multiple progress events: one [`GetProvidersOk::FoundProviders`] for each
+    /// batch of providers discovered, followed by a final
+    /// [`GetProvidersOk::FinishedWithNoAdditionalRecord`] when the query completes.
     GetProviders(GetProvidersResult),
 
     /// The result of [`Behaviour::start_providing`].
+    ///
+    /// Indicates whether the provider announcement was successfully published to the
+    /// closest peers. This is the result of the *initial* announcement; subsequent
+    /// automatic re-publications produce [`QueryResult::RepublishProvider`] events.
     StartProviding(AddProviderResult),
 
-    /// The result of a (automatic) republishing of a provider record.
+    /// The result of an automatic republication of a provider record.
+    ///
+    /// Provider records have a limited time-to-live in the DHT. The behaviour
+    /// automatically re-publishes them at regular intervals (configured via
+    /// [`Config::set_provider_publication_interval`]). This event reports the outcome
+    /// of such a re-publication. Compare with [`QueryResult::StartProviding`], which
+    /// reports the result of the *initial* publication.
     RepublishProvider(AddProviderResult),
 
     /// The result of [`Behaviour::get_record`].
+    ///
+    /// May emit multiple progress events: one [`GetRecordOk::FoundRecord`] for each peer
+    /// that returns the record, followed by a final
+    /// [`GetRecordOk::FinishedWithNoAdditionalRecord`] when the query completes. Use
+    /// [`ProgressStep::last`] to detect the final event.
     GetRecord(GetRecordResult),
 
     /// The result of [`Behaviour::put_record`].
+    ///
+    /// Emitted when the record has been stored on sufficient peers (quorum reached)
+    /// or when the query fails/times out. This is the result of the *initial* put;
+    /// subsequent automatic re-publications produce [`QueryResult::RepublishRecord`].
     PutRecord(PutRecordResult),
 
-    /// The result of a (automatic) republishing of a (value-)record.
+    /// The result of an automatic republication of a value record.
+    ///
+    /// Value records have a limited time-to-live in the DHT. The behaviour
+    /// automatically re-publishes them at regular intervals (configured via
+    /// [`Config::set_publication_interval`]). This event reports the outcome
+    /// of such a re-publication. Compare with [`QueryResult::PutRecord`], which
+    /// reports the result of the *initial* put operation.
     RepublishRecord(PutRecordResult),
 }
 
 /// The result of [`Behaviour::get_record`].
+///
+/// An `Ok` value indicates the query found records or completed successfully; an `Err`
+/// value indicates a failure (not found, quorum not reached, or timeout).
 pub type GetRecordResult = Result<GetRecordOk, GetRecordError>;
 
 /// The successful result of [`Behaviour::get_record`].
+///
+/// This enum has two variants because a `get_record` query may emit multiple progress
+/// events. Each time a peer returns the requested record, a [`GetRecordOk::FoundRecord`]
+/// event is emitted. When the query finishes with no additional records to report,
+/// [`GetRecordOk::FinishedWithNoAdditionalRecord`] is emitted as the final event.
+///
+/// # Typical Usage
+///
+/// ```ignore
+/// match event {
+///     GetRecordOk::FoundRecord(peer_record) => {
+///         // A peer returned the record — collect it.
+///     }
+///     GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates } => {
+///         // The query is complete. Optionally write back the record to
+///         // cache_candidates using Behaviour::put_record_to.
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum GetRecordOk {
+    /// A peer returned the requested record.
+    ///
+    /// This variant may be emitted multiple times during a single query — once for each
+    /// peer that holds the record. The enclosed [`PeerRecord`] contains the record value
+    /// and the peer that returned it. Check [`ProgressStep::last`] in the enclosing
+    /// [`Event::OutboundQueryProgressed`] to know if more results may follow.
     FoundRecord(PeerRecord),
+    /// The query has finished and no additional records were found.
+    ///
+    /// This is always the **final** event for a `get_record` query (i.e.
+    /// [`ProgressStep::last`] will be `true`). If caching is enabled, the
+    /// `cache_candidates` field contains peers that were close to the record key
+    /// but did not hold the record, which are good candidates for caching.
     FinishedWithNoAdditionalRecord {
         /// If caching is enabled, these are the peers closest
         /// _to the record key_ (not the local node) that were queried but
@@ -2943,19 +3223,42 @@ pub enum GetRecordOk {
 }
 
 /// The error result of [`Behaviour::get_record`].
+///
+/// Returned inside [`QueryResult::GetRecord`] when the record lookup fails.
+///
+/// # Variants
+///
+/// - [`NotFound`](GetRecordError::NotFound): The iterative lookup completed but no peer held
+///   the record. The `closest_peers` are the peers that were closest to the key.
+/// - [`QuorumFailed`](GetRecordError::QuorumFailed): Some peers returned the record, but not
+///   enough to meet the configured quorum. The partial results are available in `records`.
+/// - [`Timeout`](GetRecordError::Timeout): The query did not complete within the configured
+///   timeout.
 #[derive(Debug, Clone, Error)]
 pub enum GetRecordError {
+    /// The record was not found on any of the queried peers.
+    ///
+    /// The `closest_peers` field contains the peers that were closest to the key,
+    /// which may be useful for diagnostics or manual caching.
     #[error("the record was not found")]
     NotFound {
         key: record::Key,
         closest_peers: Vec<PeerId>,
     },
+    /// The record was found on some peers, but the quorum requirement was not met.
+    ///
+    /// The `records` field contains the partial results that were retrieved. The
+    /// application may choose to use one of these records despite the quorum failure,
+    /// or retry the query.
     #[error("the quorum failed; needed {quorum} peers")]
     QuorumFailed {
         key: record::Key,
         records: Vec<PeerRecord>,
         quorum: NonZeroUsize,
     },
+    /// The query timed out before completing.
+    ///
+    /// It is unknown how many peers were queried or whether the record exists.
     #[error("the request timed out")]
     Timeout { key: record::Key },
 }
@@ -2982,17 +3285,37 @@ impl GetRecordError {
 }
 
 /// The result of [`Behaviour::put_record`].
+///
+/// An `Ok` value indicates the record was stored on enough peers to satisfy the quorum;
+/// an `Err` value indicates the quorum was not reached or the query timed out.
 pub type PutRecordResult = Result<PutRecordOk, PutRecordError>;
 
 /// The successful result of [`Behaviour::put_record`].
+///
+/// Emitted when the record has been successfully stored on at least as many peers as
+/// required by the quorum. The `key` identifies which record was stored.
 #[derive(Debug, Clone)]
 pub struct PutRecordOk {
     pub key: record::Key,
 }
 
 /// The error result of [`Behaviour::put_record`].
+///
+/// Returned inside [`QueryResult::PutRecord`] or [`QueryResult::RepublishRecord`] when the
+/// record could not be stored on enough peers.
+///
+/// # Variants
+///
+/// - [`QuorumFailed`](PutRecordError::QuorumFailed): Some peers stored the record, but not
+///   enough to meet the quorum. The `success` field lists peers that *did* store it.
+/// - [`Timeout`](PutRecordError::Timeout): The query timed out. The `success` field lists
+///   any peers that stored the record before the timeout.
 #[derive(Debug, Clone, Error)]
 pub enum PutRecordError {
+    /// Some peers stored the record, but the quorum requirement was not met.
+    ///
+    /// The `success` field contains the peers that successfully stored the record.
+    /// The application may decide to retry or accept the partial result.
     #[error("the quorum failed; needed {quorum} peers")]
     QuorumFailed {
         key: record::Key,
@@ -3000,6 +3323,10 @@ pub enum PutRecordError {
         success: Vec<PeerId>,
         quorum: NonZeroUsize,
     },
+    /// The query timed out before the quorum could be reached.
+    ///
+    /// The `success` field contains the peers that stored the record before
+    /// the timeout occurred.
     #[error("the request timed out")]
     Timeout {
         key: record::Key,
@@ -3029,9 +3356,24 @@ impl PutRecordError {
 }
 
 /// The result of [`Behaviour::bootstrap`].
+///
+/// An `Ok` value indicates progress or successful completion of the bootstrap process;
+/// an `Err` value indicates a timeout.
 pub type BootstrapResult = Result<BootstrapOk, BootstrapError>;
 
 /// The successful result of [`Behaviour::bootstrap`].
+///
+/// Bootstrap is a multi-step process that populates the routing table by looking up peers
+/// in each k-bucket. This event is emitted once per k-bucket that is refreshed. The
+/// `num_remaining` field counts how many buckets still need to be refreshed. When
+/// `num_remaining == 0`, the bootstrap process is complete.
+///
+/// # Fields
+///
+/// - `peer`: The peer ID that was used as the target of the lookup for this step (typically
+///   a random key in the bucket's range, or the local peer ID for the first step).
+/// - `num_remaining`: The number of k-buckets remaining to be refreshed. When this reaches
+///   `0`, the bootstrap is fully complete.
 #[derive(Debug, Clone)]
 pub struct BootstrapOk {
     pub peer: PeerId,
@@ -3039,8 +3381,15 @@ pub struct BootstrapOk {
 }
 
 /// The error result of [`Behaviour::bootstrap`].
+///
+/// Currently the only failure mode is a timeout, which means the iterative lookup for
+/// a particular k-bucket did not complete in time.
 #[derive(Debug, Clone, Error)]
 pub enum BootstrapError {
+    /// The bootstrap query for a particular bucket timed out.
+    ///
+    /// `num_remaining` indicates how many buckets were still left to refresh, if known.
+    /// A `None` value means the number of remaining buckets could not be determined.
     #[error("the request timed out")]
     Timeout {
         peer: PeerId,
@@ -3049,9 +3398,19 @@ pub enum BootstrapError {
 }
 
 /// The result of [`Behaviour::get_closest_peers`].
+///
+/// An `Ok` value contains the closest peers found; an `Err` value indicates
+/// a timeout (which still includes the best peers found so far).
 pub type GetClosestPeersResult = Result<GetClosestPeersOk, GetClosestPeersError>;
 
 /// The successful result of [`Behaviour::get_closest_peers`].
+///
+/// Contains the peers that are closest to the given key according to the Kademlia XOR
+/// distance metric. The `peers` list is sorted by distance from closest to farthest
+/// and contains at most `k` entries (where `k` is the replication factor, typically 20).
+///
+/// This is a single-event query: exactly one `OutboundQueryProgressed` event is emitted
+/// with [`ProgressStep::last`] set to `true`.
 #[derive(Debug, Clone)]
 pub struct GetClosestPeersOk {
     pub key: Vec<u8>,
@@ -3059,8 +3418,14 @@ pub struct GetClosestPeersOk {
 }
 
 /// The error result of [`Behaviour::get_closest_peers`].
+///
+/// Currently the only failure mode is a timeout.
 #[derive(Debug, Clone, Error)]
 pub enum GetClosestPeersError {
+    /// The query timed out before completing.
+    ///
+    /// The `peers` field still contains the closest peers found before the timeout,
+    /// which may be useful despite the incomplete result.
     #[error("the request timed out")]
     Timeout { key: Vec<u8>, peers: Vec<PeerInfo> },
 }
@@ -3083,24 +3448,54 @@ impl GetClosestPeersError {
 }
 
 /// The result of [`Behaviour::get_providers`].
+///
+/// An `Ok` value indicates providers were found or the query completed; an `Err` value
+/// indicates a timeout.
 pub type GetProvidersResult = Result<GetProvidersOk, GetProvidersError>;
 
 /// The successful result of [`Behaviour::get_providers`].
+///
+/// This query may emit multiple progress events. Each [`GetProvidersOk::FoundProviders`]
+/// event contains a batch of newly discovered providers. When the query finishes,
+/// a final [`GetProvidersOk::FinishedWithNoAdditionalRecord`] event is emitted. Use
+/// [`ProgressStep::last`] to detect the final event.
+///
+/// # Typical Usage
+///
+/// Accumulate providers from all `FoundProviders` events until
+/// `FinishedWithNoAdditionalRecord` is received or enough providers have been found.
 #[derive(Debug, Clone)]
 pub enum GetProvidersOk {
+    /// A new batch of providers was discovered during the query.
+    ///
+    /// This variant may be emitted multiple times as the iterative lookup progresses
+    /// and different peers respond with their knowledge of providers.
     FoundProviders {
         key: record::Key,
-        /// The new set of providers discovered.
+        /// The new set of providers discovered in this batch. These are *additional*
+        /// providers not previously reported in earlier `FoundProviders` events for
+        /// the same query.
         providers: HashSet<PeerId>,
     },
+    /// The query has finished and no additional providers were found.
+    ///
+    /// This is always the **final** event for a `get_providers` query (i.e.
+    /// [`ProgressStep::last`] will be `true`). The `closest_peers` field contains
+    /// the peers closest to the key, which may be useful for diagnostics.
     FinishedWithNoAdditionalRecord {
         closest_peers: Vec<PeerId>,
     },
 }
 
 /// The error result of [`Behaviour::get_providers`].
+///
+/// Currently the only failure mode is a timeout.
 #[derive(Debug, Clone, Error)]
 pub enum GetProvidersError {
+    /// The query timed out before completing.
+    ///
+    /// The `closest_peers` field contains the closest peers found before the timeout,
+    /// which may still be useful.
     #[error("the request timed out")]
     Timeout {
         key: record::Key,
@@ -3125,18 +3520,30 @@ impl GetProvidersError {
     }
 }
 
-/// The result of publishing a provider record.
+/// The result of publishing a provider record via [`Behaviour::start_providing`] or
+/// an automatic republication.
+///
+/// An `Ok` value indicates the provider record was successfully announced to the closest
+/// peers; an `Err` value indicates a timeout.
 pub type AddProviderResult = Result<AddProviderOk, AddProviderError>;
 
 /// The successful result of publishing a provider record.
+///
+/// Indicates that this node has been successfully announced as a provider for the given
+/// key to the peers closest to that key in the DHT.
 #[derive(Debug, Clone)]
 pub struct AddProviderOk {
     pub key: record::Key,
 }
 
 /// The possible errors when publishing a provider record.
+///
+/// Returned inside [`QueryResult::StartProviding`] or [`QueryResult::RepublishProvider`]
+/// when the provider announcement fails.
 #[derive(Debug, Clone, Error)]
 pub enum AddProviderError {
+    /// The query timed out before the provider record could be published to
+    /// enough peers.
     #[error("the request timed out")]
     Timeout { key: record::Key },
 }
