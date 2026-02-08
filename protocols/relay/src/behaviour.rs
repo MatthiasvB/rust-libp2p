@@ -166,13 +166,52 @@ impl Default for Config {
     }
 }
 
-/// The events produced by the relay `Behaviour`.
+/// Events emitted by the relay [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The relay protocol (circuit relay v2) allows a node to act as a **relay server**, enabling
+/// other peers to communicate through it when they cannot establish direct connections
+/// (e.g. due to NAT). This behaviour implements the server side of the protocol.
+///
+/// # Concepts
+///
+/// - **Reservation**: A peer requests the relay to reserve a slot so that other peers
+///   can connect to it through the relay. Reservations have a limited lifetime and
+///   must be renewed.
+/// - **Circuit**: An active relayed connection between two peers (`src` → relay → `dst`).
+///   The source peer requests the relay to connect it to a destination peer that has
+///   an active reservation.
+///
+/// # Event Lifecycle
+///
+/// ## Reservation Flow
+///
+/// 1. A remote peer sends a reservation request.
+/// 2. The relay either accepts or denies the request based on configured limits.
+/// 3. **Accepted**: [`Event::ReservationReqAccepted`] is emitted. The `renewed` field
+///    indicates if this replaces an existing reservation.
+/// 4. **Denied**: [`Event::ReservationReqDenied`] is emitted.
+/// 5. **Timeout**: If the reservation expires, [`Event::ReservationTimedOut`] is emitted.
+///
+/// ## Circuit Flow
+///
+/// 1. A source peer requests a circuit to a destination peer (who has a reservation).
+/// 2. The relay either accepts or denies the circuit based on configured limits.
+/// 3. **Accepted**: [`Event::CircuitReqAccepted`] is emitted.
+/// 4. **Denied**: [`Event::CircuitReqDenied`] is emitted.
+/// 5. **Closed**: When the circuit ends, [`Event::CircuitClosed`] is emitted.
 #[derive(Debug)]
 pub enum Event {
     /// An inbound reservation request has been accepted.
+    ///
+    /// The relay has accepted a peer's request to reserve a slot. While the reservation
+    /// is active, other peers can request circuits to the reserving peer through this relay.
+    ///
+    /// If `renewed` is `true`, this reservation replaces an existing one from the same peer,
+    /// effectively extending its lifetime.
     ReservationReqAccepted {
         src_peer_id: PeerId,
-        /// Indicates whether the request replaces an existing reservation.
+        /// `true` if this reservation replaces an existing reservation from the same peer.
         renewed: bool,
     },
     /// Accepting an inbound reservation request failed.
@@ -184,6 +223,10 @@ pub enum Event {
         error: inbound_hop::Error,
     },
     /// An inbound reservation request has been denied.
+    ///
+    /// The relay denied a peer's reservation request, typically because the configured
+    /// limits (maximum reservations per peer, total reservations, etc.) have been reached.
+    /// No action is required from the application.
     ReservationReqDenied { src_peer_id: PeerId },
     /// Denying an inbound reservation request has failed.
     #[deprecated(
@@ -193,9 +236,17 @@ pub enum Event {
         src_peer_id: PeerId,
         error: inbound_hop::Error,
     },
-    /// An inbound reservation has timed out.
+    /// An inbound reservation has timed out and is no longer active.
+    ///
+    /// The peer's reservation has expired because it was not renewed within the
+    /// configured reservation lifetime. Other peers can no longer open circuits
+    /// to this peer through the relay until a new reservation is made.
     ReservationTimedOut { src_peer_id: PeerId },
     /// An inbound circuit request has been denied.
+    ///
+    /// The relay denied a source peer's request to open a circuit to a destination peer,
+    /// typically because the destination peer has no active reservation or because
+    /// configured limits have been reached.
     CircuitReqDenied {
         src_peer_id: PeerId,
         dst_peer_id: PeerId,
@@ -210,6 +261,10 @@ pub enum Event {
         error: inbound_hop::Error,
     },
     /// An inbound circuit request has been accepted.
+    ///
+    /// A source peer has been connected to a destination peer through this relay.
+    /// The relay will now forward data between the two peers until the circuit is
+    /// closed (reported via [`Event::CircuitClosed`]).
     CircuitReqAccepted {
         src_peer_id: PeerId,
         dst_peer_id: PeerId,
@@ -232,7 +287,11 @@ pub enum Event {
         dst_peer_id: PeerId,
         error: inbound_hop::Error,
     },
-    /// An inbound circuit has closed.
+    /// An active relayed circuit has closed.
+    ///
+    /// The relayed connection between the source and destination peers has ended.
+    /// If `error` is `Some`, the circuit closed due to an I/O error; otherwise it
+    /// closed gracefully (e.g. one of the peers disconnected normally).
     CircuitClosed {
         src_peer_id: PeerId,
         dst_peer_id: PeerId,
