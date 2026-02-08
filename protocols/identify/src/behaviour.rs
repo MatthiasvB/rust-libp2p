@@ -614,45 +614,110 @@ impl NetworkBehaviour for Behaviour {
     }
 }
 
-/// Event emitted  by the `Identify` behaviour.
+/// Events emitted by the Identify [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The Identify protocol allows peers to exchange information about themselves, including
+/// their public key, supported protocols, listen addresses, and agent version. This
+/// exchange happens automatically on every new connection.
+///
+/// # Event Lifecycle
+///
+/// 1. **On connection establishment**: The Identify protocol is automatically negotiated.
+///    Once the remote peer sends its identification information, a [`Event::Received`]
+///    event is emitted. Simultaneously, the local node sends its own identification,
+///    producing a [`Event::Sent`] event.
+///
+/// 2. **On change detection**: If the local node's information changes (e.g. new listen
+///    addresses are added), the behaviour may **push** updated information to connected
+///    peers, producing [`Event::Pushed`] events.
+///
+/// 3. **On error**: If the identification exchange fails (e.g. the connection closes mid-
+///    handshake or the protocol is not supported), an [`Event::Error`] event is emitted.
+///
+/// # Difference Between `Sent` and `Pushed`
+///
+/// - [`Event::Sent`]: Emitted when identification information is sent **in response to a
+///   request** from the remote peer (passive, happens once per connection).
+/// - [`Event::Pushed`]: Emitted when the local node **proactively pushes** updated
+///   information to a peer (active, happens when local info changes while connected).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Event {
-    /// Identification information has been received from a peer.
+    /// Identification information has been received from a remote peer.
+    ///
+    /// Emitted after a new connection is established and the remote peer sends its
+    /// Identify response, or when the remote peer pushes updated information.
+    /// The [`Info`] struct contains the peer's public key, protocol version,
+    /// agent version, listen addresses, supported protocols, and observed address.
+    ///
+    /// # Recommended Action
+    ///
+    /// Use the received information to update your knowledge of the remote peer. Common
+    /// uses include adding the peer's listen addresses to the address book, checking
+    /// protocol compatibility, or discovering the peer's observed address of the local
+    /// node (useful for NAT detection via [`Info::observed_addr`]).
     Received {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the information was received.
         connection_id: ConnectionId,
         /// The peer that has been identified.
         peer_id: PeerId,
-        /// The information provided by the peer.
+        /// The identification information provided by the peer, including supported
+        /// protocols, listen addresses, and the address they observe for us.
         info: Info,
     },
-    /// Identification information of the local node has been sent to a peer in
-    /// response to an identification request.
+    /// The local node's identification information has been sent to a remote peer
+    /// in response to an Identify request.
+    ///
+    /// This event is informational. It confirms that the identification exchange
+    /// completed on the local side. No action is typically required.
+    ///
+    /// This event is distinct from [`Event::Pushed`]: `Sent` is a **response** to a
+    /// request from the remote peer, while `Pushed` is a **proactive** update.
     Sent {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the information was sent.
         connection_id: ConnectionId,
         /// The peer that the information has been sent to.
         peer_id: PeerId,
     },
-    /// Identification information of the local node has been actively pushed to
-    /// a peer.
+    /// The local node's identification information has been actively pushed to a peer.
+    ///
+    /// Emitted when the local node detects that its own information has changed (e.g.
+    /// new listen addresses, new supported protocols) and proactively sends the updated
+    /// information to an already-connected peer via the Identify Push protocol.
+    ///
+    /// This event is distinct from [`Event::Sent`]: `Pushed` is a **proactive** update
+    /// triggered by local changes, while `Sent` is a **response** to a remote request.
+    ///
+    /// The `info` field contains the full identification information that was pushed.
+    /// To determine what changed, the application must compare it with previously
+    /// received information.
     Pushed {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the information was pushed.
         connection_id: ConnectionId,
         /// The peer that the information has been sent to.
         peer_id: PeerId,
-        /// The full Info struct we pushed to the remote peer. Clients must
-        /// do some diff'ing to know what has changed since the last push.
+        /// The full identification information that was pushed. Compare with previously
+        /// known information to determine what changed.
         info: Info,
     },
-    /// Error while attempting to identify the remote.
+    /// An error occurred while attempting to identify a remote peer or send identification
+    /// information.
+    ///
+    /// This may occur if the remote peer does not support the Identify protocol, if the
+    /// connection is closed before the exchange completes, or if the protocol negotiation
+    /// fails.
+    ///
+    /// # Recommended Action
+    ///
+    /// This event is typically informational. The connection may still be usable for
+    /// other protocols. Log the error for diagnostics.
     Error {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the error occurred.
         connection_id: ConnectionId,
         /// The peer with whom the error originated.
         peer_id: PeerId,
-        /// The error that occurred.
+        /// The error that occurred during the identification exchange.
         error: StreamUpgradeError<UpgradeError>,
     },
 }

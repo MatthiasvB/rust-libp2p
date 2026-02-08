@@ -44,13 +44,47 @@ use crate::{handler, protocol};
 
 pub(crate) const MAX_NUMBER_OF_UPGRADE_ATTEMPTS: u8 = 3;
 
-/// The events produced by the [`Behaviour`].
+/// The event produced by the DCUtR [`Behaviour`], delivered to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// DCUtR (Direct Connection Upgrade through Relay) is a protocol that enables two peers
+/// who are communicating via a relay to attempt a direct connection using hole-punching.
+/// This event reports the outcome of such an attempt.
+///
+/// # Event Lifecycle
+///
+/// 1. When a relayed connection exists between two peers, the DCUtR behaviour automatically
+///    initiates a hole-punching attempt to upgrade to a direct connection.
+/// 2. The protocol coordinates a synchronized dial between both peers using the relayed
+///    connection for signaling.
+/// 3. **On success**: An `Event` is emitted with `result: Ok(connection_id)`, where
+///    `connection_id` identifies the new direct connection. The relayed connection may
+///    then be closed.
+/// 4. **On failure**: An `Event` is emitted with `result: Err(error)`, indicating the
+///    hole-punching attempt failed (e.g. both peers are behind symmetric NATs). The
+///    relayed connection remains active.
+///
+/// # Recommended Action
+///
+/// - **On success**: No action required. The swarm will automatically use the new direct
+///   connection. You may optionally close the relayed connection.
+/// - **On failure**: The relayed connection continues to work. The application may retry
+///   or accept the relayed path.
 #[derive(Debug)]
 pub struct Event {
+    /// The peer with whom the direct connection upgrade was attempted.
     pub remote_peer_id: PeerId,
+    /// The result of the hole-punching attempt. `Ok(connection_id)` contains the ID
+    /// of the newly established direct connection. `Err(error)` indicates the attempt
+    /// failed.
     pub result: Result<ConnectionId, Error>,
 }
 
+/// Error that occurred during a DCUtR hole-punching attempt.
+///
+/// This wraps an internal error type. The hole-punching may fail because the maximum
+/// number of dial attempts was exceeded, or because of an error in the inbound or
+/// outbound protocol negotiation.
 #[derive(Debug, Error)]
 #[error("Failed to hole-punch connection: {inner}")]
 pub struct Error {
