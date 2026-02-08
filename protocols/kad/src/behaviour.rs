@@ -725,8 +725,20 @@ where
 
     /// Initiates an iterative query for the closest peers to the given key.
     ///
-    /// The result of the query is delivered in a
-    /// [`Event::OutboundQueryProgressed{QueryResult::GetClosestPeers}`].
+    /// The result of the query is delivered in one or more
+    /// [`Event::OutboundQueryProgressed`] events with [`QueryResult::GetClosestPeers`].
+    ///
+    /// # Using with `PeerId`
+    ///
+    /// This method accepts a [`PeerId`] directly as the key, which can be useful when you
+    /// want to discover a specific peer's neighbors or find routes toward a known peer.
+    /// However, note that this finds peers *close to* the given key in the DHT keyspace —
+    /// the target peer itself will only appear in the results if it is an active participant
+    /// in the DHT. For content lookups, use [`Behaviour::get_providers`] or
+    /// [`Behaviour::get_record`] instead.
+    ///
+    /// Addresses discovered during the lookup are automatically cached and provided to the
+    /// swarm for dialing.
     pub fn get_closest_peers<K>(&mut self, key: K) -> QueryId
     where
         K: Into<kbucket::Key<K>> + Into<Vec<u8>> + Clone,
@@ -1057,8 +1069,12 @@ where
 
     /// Performs a lookup for providers of a value to the given key.
     ///
-    /// The result of this operation is delivered in a
-    /// reported via [`Event::OutboundQueryProgressed{QueryResult::GetProviders}`].
+    /// The result of this operation is delivered via one or more
+    /// [`Event::OutboundQueryProgressed`] events with [`QueryResult::GetProviders`].
+    ///
+    /// The returned provider [`PeerId`]s can be dialed directly — Kademlia automatically
+    /// caches the addresses of peers encountered during the lookup and provides them to the
+    /// swarm. See [`GetProvidersOk::FoundProviders`] for details.
     pub fn get_providers(&mut self, key: record::Key) -> QueryId {
         let providers: HashSet<_> = self
             .store
@@ -2780,6 +2796,41 @@ pub struct PeerRecord {
 /// algorithm. For example, [`Behaviour::get_record`] initiates a query that sends individual
 /// `GetRecord` requests to multiple peers.
 ///
+/// # From Provider Discovery to Connection
+///
+/// A common question is how to get from a [`record::Key`] to a working connection with a
+/// provider of that key. Here is the typical workflow:
+///
+/// 1. Call [`Behaviour::get_providers`] with the key to discover providers.
+/// 2. Receive [`GetProvidersOk::FoundProviders`] events, each containing a set of provider
+///    [`PeerId`]s (note: only peer IDs, not addresses).
+/// 3. **Dial the provider directly** using `Swarm::dial(provider_peer_id)`. You do **not**
+///    need to resolve the provider's address separately — Kademlia automatically learns
+///    addresses of peers encountered during the query and feeds them to the swarm via
+///    [`NetworkBehaviour::handle_pending_outbound_connection`]. The swarm will use these
+///    cached addresses when dialing.
+/// 4. Once a [`SwarmEvent::ConnectionEstablished`](libp2p_swarm::SwarmEvent::ConnectionEstablished)
+///    event fires for the provider, you can communicate with it using your application protocol
+///    (e.g. request-response, a custom stream protocol, etc.).
+///
+/// In short: Kademlia handles address resolution behind the scenes. The `providers` field in
+/// [`GetProvidersOk::FoundProviders`] intentionally contains only [`PeerId`]s because addresses
+/// are managed internally by the behaviour and provided to the swarm automatically.
+///
+/// # Using `PeerId` as a Lookup Key
+///
+/// If you know the exact [`PeerId`] of the peer you want to find (rather than looking up
+/// an arbitrary content key), you can use [`Behaviour::get_closest_peers`] with the
+/// [`PeerId`] directly, since `PeerId` satisfies the required trait bounds. This performs
+/// an iterative lookup in the DHT keyspace, discovering both the target peer and its
+/// neighbors. As with provider queries, addresses discovered during the lookup are
+/// automatically cached and provided to the swarm for dialing.
+///
+/// Note that [`Behaviour::get_closest_peers`] finds peers *close to* the given key — it
+/// does not guarantee that the target peer itself will be among the results unless it is
+/// participating in the DHT. For content-addressed lookups, use [`Behaviour::get_providers`]
+/// or [`Behaviour::get_record`] instead.
+///
 /// See [`NetworkBehaviour::poll`].
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -3460,21 +3511,53 @@ pub type GetProvidersResult = Result<GetProvidersOk, GetProvidersError>;
 /// a final [`GetProvidersOk::FinishedWithNoAdditionalRecord`] event is emitted. Use
 /// [`ProgressStep::last`] to detect the final event.
 ///
+/// # Connecting to Discovered Providers
+///
+/// The `providers` field contains only [`PeerId`]s, not addresses. This is by design:
+/// during the iterative lookup, the Kademlia behaviour automatically learns and caches
+/// the addresses of all peers it contacts (including providers). When you subsequently
+/// dial a provider via `Swarm::dial(provider_peer_id)`, the swarm will obtain the
+/// provider's address from the Kademlia behaviour's cache via
+/// [`NetworkBehaviour::handle_pending_outbound_connection`].
+///
+/// In short, you can dial providers by [`PeerId`] alone — no separate address resolution
+/// step is needed.
+///
 /// # Typical Usage
 ///
-/// Accumulate providers from all `FoundProviders` events until
-/// `FinishedWithNoAdditionalRecord` is received or enough providers have been found.
+/// ```ignore
+/// // Accumulate providers across multiple events:
+/// let mut all_providers = HashSet::new();
+/// // ... in your event loop:
+/// match result {
+///     GetProvidersOk::FoundProviders { providers, .. } => {
+///         all_providers.extend(providers);
+///         // Optionally dial providers as they are discovered:
+///         for &provider in &providers {
+///             swarm.dial(provider).ok();
+///         }
+///     }
+///     GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
+///         // Query complete — all_providers contains every discovered provider.
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum GetProvidersOk {
     /// A new batch of providers was discovered during the query.
     ///
     /// This variant may be emitted multiple times as the iterative lookup progresses
     /// and different peers respond with their knowledge of providers.
+    ///
+    /// The providers can be dialed directly by [`PeerId`] — Kademlia automatically
+    /// caches their addresses during the lookup and provides them to the swarm for
+    /// dialing. No separate address resolution is needed.
     FoundProviders {
         key: record::Key,
         /// The new set of providers discovered in this batch. These are *additional*
         /// providers not previously reported in earlier `FoundProviders` events for
-        /// the same query.
+        /// the same query. Contains only [`PeerId`]s; addresses are cached internally
+        /// and provided to the swarm automatically when dialing.
         providers: HashSet<PeerId>,
     },
     /// The query has finished and no additional providers were found.
