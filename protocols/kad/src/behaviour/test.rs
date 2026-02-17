@@ -20,6 +20,8 @@
 
 #![cfg(test)]
 
+use std::collections::HashSet;
+
 use futures::{executor::block_on, future::poll_fn, prelude::*};
 use futures_timer::Delay;
 use libp2p_core::{
@@ -1493,7 +1495,7 @@ fn get_providers_single() {
                             assert!(matches!(ok, GetProvidersOk::FoundProviders { .. }));
                             if let GetProvidersOk::FoundProviders { providers, .. } = ok {
                                 assert_eq!(providers.len(), 1);
-                                assert!(providers.contains(single_swarm.local_peer_id()));
+                                assert!(providers.contains_key(single_swarm.local_peer_id()));
                             }
                         }
                     }
@@ -1567,11 +1569,11 @@ fn get_providers_limit<const N: usize>() {
                                 {
                                     // There are a total of 2 providers.
                                     assert_eq!(key, found_key);
-                                    for provider in &providers {
+                                    for provider in providers.keys() {
                                         // Providers should be either 2 or 3
                                         assert_ne!(swarm.local_peer_id(), provider);
                                     }
-                                    all_providers.extend(providers);
+                                    all_providers.extend(providers.keys());
 
                                     // If we have all providers, finish.
                                     if all_providers.len() == N {
@@ -1679,19 +1681,12 @@ fn get_providers_includes_provider_addresses() {
 
                                 return Poll::Ready(());
                             } else if let GetProvidersOk::FoundProviders {
-                                provider_addresses,
                                 providers,
                                 ..
                             } = ok
                             {
                                 // Collect addresses from each FoundProviders event.
-                                for (peer, addrs) in provider_addresses {
-                                    // Every provider in provider_addresses should also
-                                    // be in the providers set
-                                    assert!(
-                                        providers.contains(&peer),
-                                        "provider_addresses contains {peer} not in providers"
-                                    );
+                                for (peer, addrs) in providers {
                                     all_addresses
                                         .entry(peer)
                                         .or_default()
