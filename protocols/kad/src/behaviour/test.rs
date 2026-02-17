@@ -1609,6 +1609,109 @@ fn get_providers_limit_n_5() {
 }
 
 #[test]
+fn get_providers_includes_provider_addresses() {
+    fn prop(key: record::Key) {
+        let mut swarms = build_nodes(3);
+
+        // Collect peer IDs for assertions later.
+        let peer1_id = *Swarm::local_peer_id(&swarms[1].1);
+        let peer2_id = *Swarm::local_peer_id(&swarms[2].1);
+
+        // Let first peer know of second peer and second peer know of third peer.
+        for i in 0..2 {
+            let (peer_id, address) = (
+                *Swarm::local_peer_id(&swarms[i + 1].1),
+                swarms[i + 1].0.clone(),
+            );
+            swarms[i].1.behaviour_mut().add_address(&peer_id, address);
+        }
+
+        // Drop the swarm addresses.
+        let mut swarms = swarms
+            .into_iter()
+            .map(|(_addr, swarm)| swarm)
+            .collect::<Vec<_>>();
+
+        // Provide the content on peer 2 and 3.
+        for swarm in swarms.iter_mut().take(3).skip(1) {
+            swarm
+                .behaviour_mut()
+                .start_providing(key.clone())
+                .expect("could not provide");
+        }
+
+        // Query for providers from peer 1.
+        let query_id = swarms[0].behaviour_mut().get_providers(key.clone());
+
+        let mut all_addresses: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+
+        block_on(poll_fn(move |ctx| {
+            for (i, swarm) in swarms.iter_mut().enumerate() {
+                loop {
+                    match swarm.poll_next_unpin(ctx) {
+                        Poll::Ready(Some(SwarmEvent::Behaviour(
+                            Event::OutboundQueryProgressed {
+                                id,
+                                result: QueryResult::GetProviders(Ok(ok)),
+                                step: index,
+                                ..
+                            },
+                        ))) if i == 0 && id == query_id => {
+                            if index.last {
+                                // At this point we should have addresses for the providers.
+                                assert!(
+                                    !all_addresses.is_empty(),
+                                    "Expected at least one provider with addresses"
+                                );
+
+                                // Verify the addresses are non-empty for each provider
+                                for (peer_id, addrs) in &all_addresses {
+                                    assert!(
+                                        !addrs.is_empty(),
+                                        "Expected non-empty addresses for provider {peer_id}"
+                                    );
+                                    // Verify the peer is one of the expected providers
+                                    assert!(
+                                        *peer_id == peer1_id || *peer_id == peer2_id,
+                                        "Unexpected provider: {peer_id}"
+                                    );
+                                }
+
+                                return Poll::Ready(());
+                            } else if let GetProvidersOk::FoundProviders {
+                                provider_addresses,
+                                providers,
+                                ..
+                            } = ok
+                            {
+                                // Collect addresses from each FoundProviders event.
+                                for (peer, addrs) in provider_addresses {
+                                    // Every provider in provider_addresses should also
+                                    // be in the providers set
+                                    assert!(
+                                        providers.contains(&peer),
+                                        "provider_addresses contains {peer} not in providers"
+                                    );
+                                    all_addresses
+                                        .entry(peer)
+                                        .or_default()
+                                        .extend(addrs);
+                                }
+                            }
+                        }
+                        Poll::Ready(..) => {}
+                        Poll::Pending => break,
+                    }
+                }
+            }
+            Poll::Pending
+        }));
+    }
+
+    QuickCheck::new().tests(10).quickcheck(prop as fn(_))
+}
+
+#[test]
 fn cancel_query() {
     fn prop(key: record::Key) {
         let (_, mut swarm) = build_node();
