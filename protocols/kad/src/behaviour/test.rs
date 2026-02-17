@@ -1562,6 +1562,7 @@ fn get_providers_limit<const N: usize>() {
                                 if let GetProvidersOk::FoundProviders {
                                     key: found_key,
                                     providers,
+                                    ..
                                 } = ok
                                 {
                                     // There are a total of 2 providers.
