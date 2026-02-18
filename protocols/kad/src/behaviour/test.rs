@@ -20,6 +20,8 @@
 
 #![cfg(test)]
 
+use std::collections::HashSet;
+
 use futures::{executor::block_on, future::poll_fn, prelude::*};
 use futures_timer::Delay;
 use libp2p_core::{
@@ -1493,7 +1495,7 @@ fn get_providers_single() {
                             assert!(matches!(ok, GetProvidersOk::FoundProviders { .. }));
                             if let GetProvidersOk::FoundProviders { providers, .. } = ok {
                                 assert_eq!(providers.len(), 1);
-                                assert!(providers.contains(single_swarm.local_peer_id()));
+                                assert!(providers.contains_key(single_swarm.local_peer_id()));
                             }
                         }
                     }
@@ -1562,15 +1564,16 @@ fn get_providers_limit<const N: usize>() {
                                 if let GetProvidersOk::FoundProviders {
                                     key: found_key,
                                     providers,
+                                    ..
                                 } = ok
                                 {
                                     // There are a total of 2 providers.
                                     assert_eq!(key, found_key);
-                                    for provider in &providers {
+                                    for provider in providers.keys() {
                                         // Providers should be either 2 or 3
                                         assert_ne!(swarm.local_peer_id(), provider);
                                     }
-                                    all_providers.extend(providers);
+                                    all_providers.extend(providers.keys());
 
                                     // If we have all providers, finish.
                                     if all_providers.len() == N {
@@ -1605,6 +1608,102 @@ fn get_providers_limit_n_2() {
 #[test]
 fn get_providers_limit_n_5() {
     get_providers_limit::<5>();
+}
+
+#[test]
+fn get_providers_includes_provider_addresses() {
+    fn prop(key: record::Key) {
+        let mut swarms = build_nodes(3);
+
+        // Collect peer IDs for assertions later.
+        let peer1_id = *Swarm::local_peer_id(&swarms[1].1);
+        let peer2_id = *Swarm::local_peer_id(&swarms[2].1);
+
+        // Let first peer know of second peer and second peer know of third peer.
+        for i in 0..2 {
+            let (peer_id, address) = (
+                *Swarm::local_peer_id(&swarms[i + 1].1),
+                swarms[i + 1].0.clone(),
+            );
+            swarms[i].1.behaviour_mut().add_address(&peer_id, address);
+        }
+
+        // Drop the swarm addresses.
+        let mut swarms = swarms
+            .into_iter()
+            .map(|(_addr, swarm)| swarm)
+            .collect::<Vec<_>>();
+
+        // Provide the content on peer 2 and 3.
+        for swarm in swarms.iter_mut().take(3).skip(1) {
+            swarm
+                .behaviour_mut()
+                .start_providing(key.clone())
+                .expect("could not provide");
+        }
+
+        // Query for providers from peer 1.
+        let query_id = swarms[0].behaviour_mut().get_providers(key.clone());
+
+        let mut all_addresses: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+
+        block_on(poll_fn(move |ctx| {
+            for (i, swarm) in swarms.iter_mut().enumerate() {
+                loop {
+                    match swarm.poll_next_unpin(ctx) {
+                        Poll::Ready(Some(SwarmEvent::Behaviour(
+                            Event::OutboundQueryProgressed {
+                                id,
+                                result: QueryResult::GetProviders(Ok(ok)),
+                                step: index,
+                                ..
+                            },
+                        ))) if i == 0 && id == query_id => {
+                            if index.last {
+                                // At this point we should have addresses for the providers.
+                                assert!(
+                                    !all_addresses.is_empty(),
+                                    "Expected at least one provider with addresses"
+                                );
+
+                                // Verify the addresses are non-empty for each provider
+                                for (peer_id, addrs) in &all_addresses {
+                                    assert!(
+                                        !addrs.is_empty(),
+                                        "Expected non-empty addresses for provider {peer_id}"
+                                    );
+                                    // Verify the peer is one of the expected providers
+                                    assert!(
+                                        *peer_id == peer1_id || *peer_id == peer2_id,
+                                        "Unexpected provider: {peer_id}"
+                                    );
+                                }
+
+                                return Poll::Ready(());
+                            } else if let GetProvidersOk::FoundProviders {
+                                providers,
+                                ..
+                            } = ok
+                            {
+                                // Collect addresses from each FoundProviders event.
+                                for (peer, addrs) in providers {
+                                    all_addresses
+                                        .entry(peer)
+                                        .or_default()
+                                        .extend(addrs);
+                                }
+                            }
+                        }
+                        Poll::Ready(..) => {}
+                        Poll::Pending => break,
+                    }
+                }
+            }
+            Poll::Pending
+        }));
+    }
+
+    QuickCheck::new().tests(10).quickcheck(prop as fn(_))
 }
 
 #[test]
