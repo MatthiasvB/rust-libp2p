@@ -150,10 +150,11 @@ impl Behaviour {
 
         let remaining_slots = MAX_ADDR_COUNT.saturating_sub(confirmed.len());
 
+        let confirmed_set: HashSet<_> = confirmed.iter().collect();
         let candidates: Vec<_> = self
             .address_candidates
             .iter()
-            .filter(|a| !confirmed.contains(a))
+            .filter(|a| !confirmed_set.contains(a))
             .take(remaining_slots)
             .cloned()
             .collect();
@@ -563,9 +564,16 @@ mod tests {
 
         let addrs = behaviour.observed_addresses();
 
-        // The confirmed address (without P2p suffix) plus the candidate (with P2p suffix)
-        // These are different addresses so both should appear
-        assert!(addrs.len() <= MAX_ADDR_COUNT);
+        // The confirmed address (without P2p suffix) and the candidate (with P2p suffix)
+        // are technically different, so both should appear
+        let addr_with_peer = {
+            let mut a = addr.clone();
+            a.push(Protocol::P2p(me));
+            a
+        };
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&addr));
+        assert!(addrs.contains(&addr_with_peer));
     }
 
     #[test]
