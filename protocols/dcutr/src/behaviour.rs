@@ -35,7 +35,7 @@ use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{ConnectionClosed, DialFailure, FromSwarm},
     dial_opts::{self, DialOpts},
-    dummy, ConnectionDenied, ConnectionHandler, ConnectionId, NetworkBehaviour,
+    dummy, ConnectionDenied, ConnectionHandler, ConnectionId, ExternalAddresses, NetworkBehaviour,
     NewExternalAddrCandidate, NotifyHandler, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use lru::LruCache;
@@ -44,6 +44,9 @@ use thiserror::Error;
 use crate::{handler, protocol};
 
 pub(crate) const MAX_NUMBER_OF_UPGRADE_ATTEMPTS: u8 = 3;
+
+/// Maximum number of addresses to send to the remote peer during hole-punching.
+const MAX_ADDR_COUNT: usize = 20;
 
 /// The event produced by the DCUtR [`Behaviour`], delivered to the application via
 /// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
@@ -109,6 +112,10 @@ pub struct Behaviour {
     /// All direct (non-relayed) connections.
     direct_connections: HashMap<PeerId, HashSet<ConnectionId>>,
 
+    /// Confirmed external addresses (verified by e.g. AutoNAT).
+    /// These are prioritized over unverified candidates for hole-punching.
+    external_addresses: ExternalAddresses,
+
     address_candidates: Candidates,
 
     direct_to_relayed_connections: HashMap<ConnectionId, ConnectionId>,
@@ -123,6 +130,7 @@ impl Behaviour {
         Behaviour {
             queued_events: Default::default(),
             direct_connections: Default::default(),
+            external_addresses: Default::default(),
             address_candidates: Candidates::new(local_peer_id),
             direct_to_relayed_connections: Default::default(),
             outgoing_direct_connection_attempts: Default::default(),
@@ -130,7 +138,27 @@ impl Behaviour {
     }
 
     fn observed_addresses(&self) -> Vec<Multiaddr> {
-        self.address_candidates.iter().cloned().collect()
+        // Prioritize confirmed (verified) external addresses over unverified candidates.
+        // Confirmed addresses have been validated by e.g. AutoNAT and are more likely
+        // to have active NAT/firewall mappings, making them more useful for hole-punching.
+        let confirmed: Vec<_> = self
+            .external_addresses
+            .iter()
+            .filter(|a| !is_relayed(a))
+            .cloned()
+            .collect();
+
+        let remaining_slots = MAX_ADDR_COUNT.saturating_sub(confirmed.len());
+
+        let candidates: Vec<_> = self
+            .address_candidates
+            .iter()
+            .filter(|a| !confirmed.contains(a))
+            .take(remaining_slots)
+            .cloned()
+            .collect();
+
+        confirmed.into_iter().chain(candidates).collect()
     }
 
     fn on_dial_failure(
@@ -369,6 +397,8 @@ impl NetworkBehaviour for Behaviour {
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        self.external_addresses.on_swarm_event(&event);
+
         match event {
             FromSwarm::ConnectionClosed(connection_closed) => {
                 self.on_connection_closed(connection_closed)
@@ -397,7 +427,7 @@ struct Candidates {
 impl Candidates {
     fn new(me: PeerId) -> Self {
         Self {
-            inner: LruCache::new(NonZeroUsize::new(20).expect("20 > 0")),
+            inner: LruCache::new(NonZeroUsize::new(MAX_ADDR_COUNT).expect("> 0")),
             me,
         }
     }
@@ -421,4 +451,172 @@ impl Candidates {
 
 fn is_relayed(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| p == Protocol::P2pCircuit)
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p_core::multiaddr::Protocol;
+    use libp2p_swarm::behaviour::{ExternalAddrConfirmed, ExternalAddrExpired, FromSwarm};
+
+    use super::*;
+
+    fn peer_id() -> PeerId {
+        PeerId::random()
+    }
+
+    fn memory_addr(port: u64) -> Multiaddr {
+        Multiaddr::empty().with(Protocol::Memory(port))
+    }
+
+    fn relayed_addr(port: u64) -> Multiaddr {
+        Multiaddr::empty()
+            .with(Protocol::Memory(port))
+            .with(Protocol::P2p(PeerId::random()))
+            .with(Protocol::P2pCircuit)
+    }
+
+    #[test]
+    fn confirmed_addresses_are_prioritized_over_candidates() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        // Add candidate addresses
+        let candidate1 = memory_addr(1000);
+        let candidate2 = memory_addr(2000);
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate {
+                addr: &candidate1,
+            },
+        ));
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate {
+                addr: &candidate2,
+            },
+        ));
+
+        // Add confirmed address
+        let confirmed = memory_addr(3000);
+        behaviour.on_swarm_event(FromSwarm::ExternalAddrConfirmed(ExternalAddrConfirmed {
+            addr: &confirmed,
+        }));
+
+        let addrs = behaviour.observed_addresses();
+
+        // Confirmed address should come first
+        assert_eq!(addrs[0], confirmed);
+
+        // Candidates should follow (with P2p suffix appended by Candidates::add)
+        assert!(addrs.len() == 3);
+    }
+
+    #[test]
+    fn candidates_fill_remaining_slots_after_confirmed() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        // Fill confirmed addresses up to MAX_ADDR_COUNT
+        for i in 0..(MAX_ADDR_COUNT as u64) {
+            let addr = memory_addr(i);
+            behaviour.on_swarm_event(FromSwarm::ExternalAddrConfirmed(ExternalAddrConfirmed {
+                addr: &addr,
+            }));
+        }
+
+        // Add candidate
+        let candidate = memory_addr(9999);
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate {
+                addr: &candidate,
+            },
+        ));
+
+        let addrs = behaviour.observed_addresses();
+
+        // Should be capped at MAX_ADDR_COUNT
+        assert_eq!(addrs.len(), MAX_ADDR_COUNT);
+
+        // Candidate should NOT be included since confirmed fills all slots
+        let candidate_with_peer = {
+            let mut a = candidate;
+            a.push(Protocol::P2p(me));
+            a
+        };
+        assert!(!addrs.contains(&candidate_with_peer));
+    }
+
+    #[test]
+    fn duplicate_addresses_not_included_twice() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let addr = memory_addr(1000);
+
+        // Add as confirmed
+        behaviour.on_swarm_event(FromSwarm::ExternalAddrConfirmed(ExternalAddrConfirmed {
+            addr: &addr,
+        }));
+
+        // Also add as candidate (the candidate will have P2p suffix, confirmed won't)
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate { addr: &addr },
+        ));
+
+        let addrs = behaviour.observed_addresses();
+
+        // The confirmed address (without P2p suffix) plus the candidate (with P2p suffix)
+        // These are different addresses so both should appear
+        assert!(addrs.len() <= MAX_ADDR_COUNT);
+    }
+
+    #[test]
+    fn expired_confirmed_addresses_are_removed() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let confirmed = memory_addr(1000);
+        behaviour.on_swarm_event(FromSwarm::ExternalAddrConfirmed(ExternalAddrConfirmed {
+            addr: &confirmed,
+        }));
+
+        // Verify it's present
+        let addrs = behaviour.observed_addresses();
+        assert!(addrs.contains(&confirmed));
+
+        // Expire it
+        behaviour.on_swarm_event(FromSwarm::ExternalAddrExpired(ExternalAddrExpired {
+            addr: &confirmed,
+        }));
+
+        let addrs = behaviour.observed_addresses();
+        assert!(!addrs.contains(&confirmed));
+    }
+
+    #[test]
+    fn relayed_confirmed_addresses_are_excluded() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let relayed = relayed_addr(1000);
+        behaviour.on_swarm_event(FromSwarm::ExternalAddrConfirmed(ExternalAddrConfirmed {
+            addr: &relayed,
+        }));
+
+        let direct = memory_addr(2000);
+        behaviour.on_swarm_event(FromSwarm::ExternalAddrConfirmed(ExternalAddrConfirmed {
+            addr: &direct,
+        }));
+
+        let addrs = behaviour.observed_addresses();
+
+        // Only the direct address should be present
+        assert!(addrs.contains(&direct));
+        assert!(!addrs.contains(&relayed));
+    }
+
+    #[test]
+    fn empty_behaviour_returns_no_addresses() {
+        let me = peer_id();
+        let behaviour = Behaviour::new(me);
+        assert!(behaviour.observed_addresses().is_empty());
+    }
 }
