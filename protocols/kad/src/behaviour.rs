@@ -23,7 +23,7 @@
 mod test;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     num::NonZeroUsize,
     task::{Context, Poll, Waker},
@@ -1086,7 +1086,7 @@ where
     /// caches the addresses of peers encountered during the lookup and provides them to the
     /// swarm. See [`GetProvidersOk::FoundProviders`] for details.
     pub fn get_providers(&mut self, key: record::Key) -> QueryId {
-        let providers: HashSet<_> = self
+        let providers: HashMap<_, _> = self
             .store
             .providers(&key)
             .into_iter()
@@ -1098,7 +1098,7 @@ where
                     true
                 }
             })
-            .map(|p| p.provider)
+            .map(|p| (p.provider, p.addresses))
             .collect();
 
         let step = ProgressStep::first();
@@ -2404,7 +2404,10 @@ where
                     } = query.info
                     {
                         *providers_found += provider_peers.len();
-                        let providers = provider_peers.iter().map(|p| p.node_id).collect();
+                        let providers = provider_peers
+                            .iter()
+                            .map(|p| (p.node_id, p.multiaddrs.clone()))
+                            .collect();
 
                         self.queued_events.push_back(ToSwarm::GenerateEvent(
                             Event::OutboundQueryProgressed {
@@ -2815,19 +2818,20 @@ pub struct PeerRecord {
 ///
 /// 1. Call [`Behaviour::get_providers`] with the key to discover providers.
 /// 2. Receive [`GetProvidersOk::FoundProviders`] events, each containing a set of provider
-///    [`PeerId`]s (note: only peer IDs, not addresses).
+///    [`PeerId`]s and their known addresses in `provider_addresses`.
 /// 3. **Dial the provider directly** using `Swarm::dial(provider_peer_id)`. You do **not**
 ///    need to resolve the provider's address separately — Kademlia automatically learns
 ///    addresses of peers encountered during the query and feeds them to the swarm via
 ///    [`NetworkBehaviour::handle_pending_outbound_connection`]. The swarm will use these
-///    cached addresses when dialing.
+///    cached addresses when dialing. You can also inspect the `providers` map to see
+///    which addresses are known for each provider.
 /// 4. Once a [`SwarmEvent::ConnectionEstablished`](libp2p_swarm::SwarmEvent::ConnectionEstablished)
 ///    event fires for the provider, you can communicate with it using your application protocol
 ///    (e.g. request-response, a custom stream protocol, etc.).
 ///
-/// In short: Kademlia handles address resolution behind the scenes. The `providers` field in
-/// [`GetProvidersOk::FoundProviders`] intentionally contains only [`PeerId`]s because addresses
-/// are managed internally by the behaviour and provided to the swarm automatically.
+/// In short: Kademlia handles address resolution behind the scenes. The `providers` field
+/// in [`GetProvidersOk::FoundProviders`] additionally exposes the known addresses for
+/// each provider for inspection and debugging purposes.
 ///
 /// # Using `PeerId` as a Lookup Key
 ///
@@ -3513,28 +3517,29 @@ pub type GetProvidersResult = Result<GetProvidersOk, GetProvidersError>;
 ///
 /// # Connecting to Discovered Providers
 ///
-/// The `providers` field contains only [`PeerId`]s, not addresses. This is by design:
-/// during the iterative lookup, the Kademlia behaviour automatically learns and caches
-/// the addresses of all peers it contacts (including providers). When you subsequently
-/// dial a provider via `Swarm::dial(provider_peer_id)`, the swarm will obtain the
-/// provider's address from the Kademlia behaviour's cache via
+/// The `providers` field is a map from each provider's [`PeerId`] to their known
+/// [`Multiaddr`]s. Use `providers.keys()` to iterate over just the [`PeerId`]s.
+/// During the iterative lookup, the Kademlia behaviour automatically learns
+/// and caches the addresses of all peers it contacts (including providers). When you
+/// subsequently dial a provider via `Swarm::dial(provider_peer_id)`, the swarm will obtain
+/// the provider's address from the Kademlia behaviour's cache via
 /// [`NetworkBehaviour::handle_pending_outbound_connection`].
 ///
 /// In short, you can dial providers by [`PeerId`] alone — no separate address resolution
-/// step is needed.
+/// step is needed. The addresses in `providers` are provided for transparency and debugging.
 ///
 /// # Typical Usage
 ///
 /// ```ignore
 /// // Accumulate providers across multiple events:
-/// let mut all_providers = HashSet::new();
+/// let mut all_providers = HashMap::new();
 /// // ... in your event loop:
 /// match result {
 ///     GetProvidersOk::FoundProviders { providers, .. } => {
 ///         all_providers.extend(providers);
 ///         // Optionally dial providers as they are discovered:
-///         for &provider in &providers {
-///             swarm.dial(provider).ok();
+///         for provider in all_providers.keys() {
+///             swarm.dial(*provider).ok();
 ///         }
 ///     }
 ///     GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
@@ -3554,11 +3559,21 @@ pub enum GetProvidersOk {
     /// dialing. No separate address resolution is needed.
     FoundProviders {
         key: record::Key,
-        /// The new set of providers discovered in this batch. These are *additional*
-        /// providers not previously reported in earlier `FoundProviders` events for
-        /// the same query. Contains only [`PeerId`]s; addresses are cached internally
+        /// The providers discovered in this batch, mapped to their known addresses.
+        ///
+        /// These are *additional* providers not previously reported in earlier
+        /// `FoundProviders` events for the same query. Use `providers.keys()` to
+        /// iterate over just the [`PeerId`]s. Addresses are also cached internally
         /// and provided to the swarm automatically when dialing.
-        providers: HashSet<PeerId>,
+        ///
+        /// The addresses are those known at the time the event is emitted. For
+        /// locally stored provider records, these are the addresses stored with the
+        /// record. For remotely discovered providers, these are the addresses
+        /// reported by the responding peer.
+        ///
+        /// Note that these addresses may not be exhaustive — additional addresses
+        /// may be discovered later or may already be cached in the routing table.
+        providers: HashMap<PeerId, Vec<Multiaddr>>,
     },
     /// The query has finished and no additional providers were found.
     ///
