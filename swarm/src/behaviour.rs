@@ -295,7 +295,15 @@ pub enum ToSwarm<TOutEvent, TInEvent> {
     /// - A protocol such as identify obtained it from a remote.
     /// - The user provided it based on configuration.
     /// - We made an educated guess based on one of our listen addresses.
-    NewExternalAddrCandidate(Multiaddr),
+    NewExternalAddrCandidate {
+        address: Multiaddr,
+        /// The connection on which the address was observed.
+        ///
+        /// This allows behaviours to track the liveness of the address:
+        /// if the connection closes, any NAT mapping associated with the observed address
+        /// is likely no longer valid.
+        connection_id: ConnectionId,
+    },
 
     /// Indicates to the [`Swarm`](crate::Swarm) that the provided address is confirmed to be
     /// externally reachable.
@@ -362,7 +370,7 @@ impl<TOutEvent, TInEventOld> ToSwarm<TOutEvent, TInEventOld> {
                 peer_id,
                 connection,
             },
-            ToSwarm::NewExternalAddrCandidate(addr) => ToSwarm::NewExternalAddrCandidate(addr),
+            ToSwarm::NewExternalAddrCandidate { address, connection_id } => ToSwarm::NewExternalAddrCandidate { address, connection_id },
             ToSwarm::ExternalAddrConfirmed(addr) => ToSwarm::ExternalAddrConfirmed(addr),
             ToSwarm::ExternalAddrExpired(addr) => ToSwarm::ExternalAddrExpired(addr),
             ToSwarm::NewExternalAddrOfPeer {
@@ -393,7 +401,7 @@ impl<TOutEvent, THandlerIn> ToSwarm<TOutEvent, THandlerIn> {
                 handler,
                 event,
             },
-            ToSwarm::NewExternalAddrCandidate(addr) => ToSwarm::NewExternalAddrCandidate(addr),
+            ToSwarm::NewExternalAddrCandidate { address, connection_id } => ToSwarm::NewExternalAddrCandidate { address, connection_id },
             ToSwarm::ExternalAddrConfirmed(addr) => ToSwarm::ExternalAddrConfirmed(addr),
             ToSwarm::ExternalAddrExpired(addr) => ToSwarm::ExternalAddrExpired(addr),
             ToSwarm::CloseConnection {
@@ -581,6 +589,12 @@ pub struct ListenerClosed<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct NewExternalAddrCandidate<'a> {
     pub addr: &'a Multiaddr,
+    /// The connection on which the address was observed.
+    ///
+    /// This allows behaviours to track the liveness of the address:
+    /// if the connection closes, any NAT mapping associated with the observed address
+    /// is likely no longer valid.
+    pub connection_id: ConnectionId,
 }
 
 /// [`FromSwarm`] variant that informs the behaviour that an external address was confirmed.

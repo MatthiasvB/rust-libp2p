@@ -138,7 +138,7 @@ async fn only_emits_address_candidate_once_per_connection() {
     let external_address_candidates = swarm_events
         .iter()
         .filter_map(|e| match e {
-            SwarmEvent::NewExternalAddrCandidate { address } => Some(address.clone()),
+            SwarmEvent::NewExternalAddrCandidate { address, .. } => Some(address.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();

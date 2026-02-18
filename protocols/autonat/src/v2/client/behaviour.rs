@@ -105,7 +105,7 @@ where
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
-            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr }) => {
+            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr, .. }) => {
                 self.address_candidates
                     .entry(addr.clone())
                     .or_default()

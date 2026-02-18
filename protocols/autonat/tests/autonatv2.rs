@@ -6,7 +6,8 @@ use libp2p_autonat::v2::{
 };
 use libp2p_core::{multiaddr::Protocol, transport::TransportError, Multiaddr};
 use libp2p_swarm::{
-    DialError, FromSwarm, NetworkBehaviour, NewExternalAddrCandidate, Swarm, SwarmEvent,
+    ConnectionId, DialError, FromSwarm, NetworkBehaviour, NewExternalAddrCandidate, Swarm,
+    SwarmEvent,
 };
 use libp2p_swarm_test::SwarmExt;
 use rand_core::OsRng;
@@ -79,7 +80,7 @@ async fn confirm_successful() {
 
     let bob_task = async {
         bob.wait(|event| match event {
-            SwarmEvent::NewExternalAddrCandidate { address } => Some(address),
+            SwarmEvent::NewExternalAddrCandidate { address, .. } => Some(address),
             _ => None,
         })
         .await;
@@ -140,7 +141,7 @@ async fn dial_back_to_unsupported_protocol() {
     bob.behaviour_mut()
         .autonat
         .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
-            NewExternalAddrCandidate { addr: &test_addr },
+            NewExternalAddrCandidate { addr: &test_addr, connection_id: ConnectionId::new_unchecked(0) },
         ));
 
     let (bob_done_tx, bob_done_rx) = oneshot::channel();
@@ -238,7 +239,7 @@ async fn dial_back_to_non_libp2p() {
     bob.behaviour_mut()
         .autonat
         .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
-            NewExternalAddrCandidate { addr: &addr },
+            NewExternalAddrCandidate { addr: &addr, connection_id: ConnectionId::new_unchecked(0) },
         ));
 
     let alice_task = async {
@@ -332,6 +333,7 @@ async fn dial_back_to_not_supporting() {
         .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
             NewExternalAddrCandidate {
                 addr: &unreachable_address,
+                connection_id: ConnectionId::new_unchecked(0),
             },
         ));
 
@@ -518,7 +520,7 @@ async fn bootstrap() -> (Swarm<CombinedServer>, Swarm<CombinedClient>) {
 
     let bob_task = async {
         bob.wait(|event| match event {
-            SwarmEvent::NewExternalAddrCandidate { address } => Some(address),
+            SwarmEvent::NewExternalAddrCandidate { address, .. } => Some(address),
             _ => None,
         })
         .await;

@@ -478,7 +478,7 @@ where
                 self.on_expired_listen_addr
                     .push((listener_id, addr.clone()));
             }
-            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr }) => {
+            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr, .. }) => {
                 self.on_new_external_addr.push(addr.clone());
             }
             FromSwarm::ExternalAddrExpired(ExternalAddrExpired { addr }) => {

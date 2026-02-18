@@ -387,7 +387,15 @@ pub enum SwarmEvent<TBehaviourOutEvent> {
     ///
     /// - `NewExternalAddrCandidate`: A *potential* external address — not yet verified.
     /// - [`SwarmEvent::ExternalAddrConfirmed`]: A *verified* external address.
-    NewExternalAddrCandidate { address: Multiaddr },
+    NewExternalAddrCandidate {
+        address: Multiaddr,
+        /// The connection on which the address was observed.
+        ///
+        /// This allows applications to track the liveness of the address:
+        /// if the connection closes, any NAT mapping associated with the observed address
+        /// is likely no longer valid.
+        connection_id: ConnectionId,
+    },
     /// An external address of this node has been confirmed as publicly reachable.
     ///
     /// The address has been verified (e.g. by AutoNAT or by the application calling
@@ -1263,14 +1271,14 @@ where
 
                 self.pending_handler_event = Some((peer_id, handler, event));
             }
-            ToSwarm::NewExternalAddrCandidate(addr) => {
+            ToSwarm::NewExternalAddrCandidate { address: addr, connection_id } => {
                 if !self.confirmed_external_addr.contains(&addr) {
                     self.behaviour
                         .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
-                            NewExternalAddrCandidate { addr: &addr },
+                            NewExternalAddrCandidate { addr: &addr, connection_id },
                         ));
                     self.pending_swarm_events
-                        .push_back(SwarmEvent::NewExternalAddrCandidate { address: addr });
+                        .push_back(SwarmEvent::NewExternalAddrCandidate { address: addr, connection_id });
                 }
             }
             ToSwarm::ExternalAddrConfirmed(addr) => {

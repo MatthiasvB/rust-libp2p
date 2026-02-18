@@ -323,7 +323,7 @@ impl<TBvEv> super::Recorder<SwarmEvent<TBvEv>> for Metrics {
             SwarmEvent::Dialing { .. } => {
                 self.dial_attempt.inc();
             }
-            SwarmEvent::NewExternalAddrCandidate { address } => {
+            SwarmEvent::NewExternalAddrCandidate { address, .. } => {
                 self.external_addr_candidates
                     .get_or_create(&AddressLabels {
                         protocols: protocol_stack::as_string(address),

@@ -349,11 +349,11 @@ impl Behaviour {
             // If address translation yielded nothing, broadcast the original candidate address.
             if translated_addresses.is_empty() {
                 self.events
-                    .push_back(ToSwarm::NewExternalAddrCandidate(observed.clone()));
+                    .push_back(ToSwarm::NewExternalAddrCandidate { address: observed.clone(), connection_id });
             } else {
                 for addr in translated_addresses {
                     self.events
-                        .push_back(ToSwarm::NewExternalAddrCandidate(addr));
+                        .push_back(ToSwarm::NewExternalAddrCandidate { address: addr, connection_id });
                 }
             }
             return;
@@ -362,7 +362,7 @@ impl Behaviour {
         // outgoing connection dialed with port reuse
         // incoming connection
         self.events
-            .push_back(ToSwarm::NewExternalAddrCandidate(observed.clone()));
+            .push_back(ToSwarm::NewExternalAddrCandidate { address: observed.clone(), connection_id });
     }
 }
 

@@ -371,11 +371,16 @@ impl NetworkBehaviour for Behaviour {
     fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
             FromSwarm::ConnectionClosed(connection_closed) => {
+                self.address_candidates
+                    .remove_by_connection(connection_closed.connection_id);
                 self.on_connection_closed(connection_closed)
             }
             FromSwarm::DialFailure(dial_failure) => self.on_dial_failure(dial_failure),
-            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr }) => {
-                self.address_candidates.add(addr.clone());
+            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate {
+                addr,
+                connection_id,
+            }) => {
+                self.address_candidates.add(addr.clone(), connection_id);
             }
             _ => {}
         }
@@ -389,8 +394,12 @@ impl NetworkBehaviour for Behaviour {
 /// Most of these addresses will come from observations by other nodes (via e.g. the identify
 /// protocol). More common observations mean a more likely stable port-mapping and thus a higher
 /// chance of a successful hole-punch.
+///
+/// Each address is associated with the [`ConnectionId`] on which it was observed.
+/// When a connection closes, addresses observed on that connection are removed,
+/// since the NAT mapping that made them valid is likely gone.
 struct Candidates {
-    inner: LruCache<Multiaddr, ()>,
+    inner: LruCache<Multiaddr, ConnectionId>,
     me: PeerId,
 }
 
@@ -402,7 +411,7 @@ impl Candidates {
         }
     }
 
-    fn add(&mut self, mut address: Multiaddr) {
+    fn add(&mut self, mut address: Multiaddr, connection_id: ConnectionId) {
         if is_relayed(&address) {
             return;
         }
@@ -411,7 +420,21 @@ impl Candidates {
             address.push(Protocol::P2p(self.me));
         }
 
-        self.inner.push(address, ());
+        self.inner.push(address, connection_id);
+    }
+
+    /// Remove all addresses that were observed on the given connection.
+    fn remove_by_connection(&mut self, connection_id: ConnectionId) {
+        // We must collect keys first to avoid borrowing issues.
+        let to_remove: Vec<_> = self
+            .inner
+            .iter()
+            .filter(|(_, cid)| **cid == connection_id)
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        for addr in to_remove {
+            self.inner.pop(&addr);
+        }
     }
 
     fn iter(&self) -> impl Iterator<Item = &Multiaddr> {
@@ -421,4 +444,144 @@ impl Candidates {
 
 fn is_relayed(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| p == Protocol::P2pCircuit)
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p_core::multiaddr::Protocol;
+    use libp2p_swarm::behaviour::{ConnectionClosed, FromSwarm};
+
+    use super::*;
+
+    fn peer_id() -> PeerId {
+        PeerId::random()
+    }
+
+    fn memory_addr(port: u64) -> Multiaddr {
+        Multiaddr::empty().with(Protocol::Memory(port))
+    }
+
+    #[test]
+    fn candidates_store_connection_id() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let addr = memory_addr(1000);
+        let conn_id = ConnectionId::new_unchecked(42);
+
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate {
+                addr: &addr,
+                connection_id: conn_id,
+            },
+        ));
+
+        let addrs = behaviour.observed_addresses();
+        assert_eq!(addrs.len(), 1);
+    }
+
+    #[test]
+    fn addresses_evicted_when_connection_closes() {
+        let me = peer_id();
+        let peer = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let addr1 = memory_addr(1000);
+        let addr2 = memory_addr(2000);
+        let conn_id_1 = ConnectionId::new_unchecked(1);
+        let conn_id_2 = ConnectionId::new_unchecked(2);
+
+        // Add two addresses on different connections
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate {
+                addr: &addr1,
+                connection_id: conn_id_1,
+            },
+        ));
+        behaviour.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate {
+                addr: &addr2,
+                connection_id: conn_id_2,
+            },
+        ));
+        assert_eq!(behaviour.observed_addresses().len(), 2);
+
+        // Establish a direct (non-relayed) connection so on_connection_closed doesn't panic
+        let direct_addr = memory_addr(3000);
+        let direct_endpoint = ConnectedPoint::Dialer {
+            address: direct_addr,
+            role_override: Endpoint::Dialer,
+            port_use: libp2p_core::transport::PortUse::Reuse,
+        };
+        behaviour
+            .direct_connections
+            .entry(peer)
+            .or_default()
+            .insert(conn_id_1);
+
+        // Close connection 1 — addr1 should be evicted
+        behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+            peer_id: peer,
+            connection_id: conn_id_1,
+            endpoint: &direct_endpoint,
+            cause: None,
+            remaining_established: 0,
+        }));
+
+        let remaining = behaviour.observed_addresses();
+        assert_eq!(remaining.len(), 1);
+        // addr2 (with P2p suffix) should still be there
+        let mut expected_addr2 = addr2;
+        expected_addr2.push(Protocol::P2p(me));
+        assert_eq!(remaining[0], expected_addr2);
+    }
+
+    #[test]
+    fn only_addresses_for_closed_connection_are_removed() {
+        let me = peer_id();
+        let mut candidates = Candidates::new(me);
+
+        let conn_id_1 = ConnectionId::new_unchecked(10);
+        let conn_id_2 = ConnectionId::new_unchecked(20);
+
+        let addr1 = memory_addr(100);
+        let addr2 = memory_addr(200);
+        let addr3 = memory_addr(300);
+
+        candidates.add(addr1, conn_id_1);
+        candidates.add(addr2, conn_id_1);
+        candidates.add(addr3, conn_id_2);
+
+        assert_eq!(candidates.iter().count(), 3);
+
+        // Remove all addresses from connection 1
+        candidates.remove_by_connection(conn_id_1);
+
+        let remaining: Vec<_> = candidates.iter().cloned().collect();
+        assert_eq!(remaining.len(), 1);
+        let mut expected_addr3 = memory_addr(300);
+        expected_addr3.push(Protocol::P2p(me));
+        assert_eq!(remaining[0], expected_addr3);
+    }
+
+    #[test]
+    fn relayed_addresses_are_not_stored() {
+        let me = peer_id();
+        let mut candidates = Candidates::new(me);
+
+        let relayed = Multiaddr::empty()
+            .with(Protocol::Memory(1000))
+            .with(Protocol::P2p(PeerId::random()))
+            .with(Protocol::P2pCircuit);
+
+        candidates.add(relayed, ConnectionId::new_unchecked(1));
+        assert_eq!(candidates.iter().count(), 0);
+    }
+
+    #[test]
+    fn empty_behaviour_returns_no_addresses() {
+        let me = peer_id();
+        let behaviour = Behaviour::new(me);
+        assert!(behaviour.observed_addresses().is_empty());
+    }
 }
