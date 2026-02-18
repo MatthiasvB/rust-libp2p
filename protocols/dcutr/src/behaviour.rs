@@ -23,7 +23,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    num::NonZeroUsize,
     task::{Context, Poll},
 };
 
@@ -35,10 +34,9 @@ use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{ConnectionClosed, DialFailure, FromSwarm},
     dial_opts::{self, DialOpts},
-    dummy, ConnectionDenied, ConnectionHandler, ConnectionId, NetworkBehaviour,
-    NewExternalAddrCandidate, NotifyHandler, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+    dummy, ConnectionDenied, ConnectionHandler, ConnectionId, NetworkBehaviour, NotifyHandler,
+    THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
-use lru::LruCache;
 use thiserror::Error;
 
 use crate::{handler, protocol};
@@ -109,7 +107,16 @@ pub struct Behaviour {
     /// All direct (non-relayed) connections.
     direct_connections: HashMap<PeerId, HashSet<ConnectionId>>,
 
-    address_candidates: Candidates,
+    /// Hole-punch address candidates, managed explicitly by the application.
+    ///
+    /// The application adds addresses via [`Behaviour::add_address`] and removes
+    /// them via [`Behaviour::remove_address`]. This gives the application full
+    /// control over which addresses are advertised during hole-punching, allowing
+    /// it to correlate addresses with relay connection lifecycles.
+    address_candidates: Vec<Multiaddr>,
+
+    /// The local peer ID, used to append `/p2p/<peer_id>` to candidate addresses.
+    me: PeerId,
 
     direct_to_relayed_connections: HashMap<ConnectionId, ConnectionId>,
 
@@ -123,14 +130,65 @@ impl Behaviour {
         Behaviour {
             queued_events: Default::default(),
             direct_connections: Default::default(),
-            address_candidates: Candidates::new(local_peer_id),
+            address_candidates: Vec::new(),
+            me: local_peer_id,
             direct_to_relayed_connections: Default::default(),
             outgoing_direct_connection_attempts: Default::default(),
         }
     }
 
+    /// Add an address candidate for hole-punching.
+    ///
+    /// The application should call this when it learns a valid external address,
+    /// typically by correlating observed addresses from identify with active relay
+    /// connections. Only addresses associated with live relay connections should be
+    /// added, since their NAT mappings are known to be active.
+    ///
+    /// The address will have `/p2p/<local_peer_id>` appended if not already present.
+    /// Relayed addresses (containing `/p2p-circuit`) are ignored.
+    pub fn add_address(&mut self, mut address: Multiaddr) {
+        if is_relayed(&address) {
+            tracing::trace!(%address, "Ignoring relayed address candidate");
+            return;
+        }
+
+        if address.iter().last() != Some(Protocol::P2p(self.me)) {
+            address.push(Protocol::P2p(self.me));
+        }
+
+        if !self.address_candidates.contains(&address) {
+            tracing::debug!(%address, "Adding hole-punch address candidate");
+            self.address_candidates.push(address);
+        }
+    }
+
+    /// Remove an address candidate for hole-punching.
+    ///
+    /// The application should call this when a relay connection closes or a
+    /// reservation expires, so that stale addresses are no longer advertised
+    /// during hole-punching.
+    ///
+    /// The address will have `/p2p/<local_peer_id>` appended if not already present
+    /// before attempting removal.
+    pub fn remove_address(&mut self, mut address: Multiaddr) {
+        if address.iter().last() != Some(Protocol::P2p(self.me)) {
+            address.push(Protocol::P2p(self.me));
+        }
+
+        if let Some(pos) = self.address_candidates.iter().position(|a| *a == address) {
+            tracing::debug!(%address, "Removing hole-punch address candidate");
+            self.address_candidates.swap_remove(pos);
+        }
+    }
+
     fn observed_addresses(&self) -> Vec<Multiaddr> {
-        self.address_candidates.iter().cloned().collect()
+        let addrs = self.address_candidates.clone();
+        tracing::debug!(
+            count = addrs.len(),
+            addresses = ?addrs,
+            "Collecting hole-punch candidate addresses"
+        );
+        addrs
     }
 
     fn on_dial_failure(
@@ -374,51 +432,94 @@ impl NetworkBehaviour for Behaviour {
                 self.on_connection_closed(connection_closed)
             }
             FromSwarm::DialFailure(dial_failure) => self.on_dial_failure(dial_failure),
-            FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr }) => {
-                self.address_candidates.add(addr.clone());
-            }
             _ => {}
         }
     }
 }
 
-/// Stores our address candidates.
-///
-/// We use an [`LruCache`] to favor addresses that are reported more often.
-/// When attempting a hole-punch, we will try more frequent addresses first.
-/// Most of these addresses will come from observations by other nodes (via e.g. the identify
-/// protocol). More common observations mean a more likely stable port-mapping and thus a higher
-/// chance of a successful hole-punch.
-struct Candidates {
-    inner: LruCache<Multiaddr, ()>,
-    me: PeerId,
-}
-
-impl Candidates {
-    fn new(me: PeerId) -> Self {
-        Self {
-            inner: LruCache::new(NonZeroUsize::new(20).expect("20 > 0")),
-            me,
-        }
-    }
-
-    fn add(&mut self, mut address: Multiaddr) {
-        if is_relayed(&address) {
-            return;
-        }
-
-        if address.iter().last() != Some(Protocol::P2p(self.me)) {
-            address.push(Protocol::P2p(self.me));
-        }
-
-        self.inner.push(address, ());
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &Multiaddr> {
-        self.inner.iter().map(|(a, _)| a)
-    }
-}
-
 fn is_relayed(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| p == Protocol::P2pCircuit)
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p_core::multiaddr::Protocol;
+
+    use super::*;
+
+    fn peer_id() -> PeerId {
+        PeerId::random()
+    }
+
+    fn memory_addr(port: u64) -> Multiaddr {
+        Multiaddr::empty().with(Protocol::Memory(port))
+    }
+
+    #[test]
+    fn add_address_appends_p2p() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let addr = memory_addr(1000);
+        behaviour.add_address(addr.clone());
+
+        let addrs = behaviour.observed_addresses();
+        assert_eq!(addrs.len(), 1);
+        let mut expected = addr;
+        expected.push(Protocol::P2p(me));
+        assert_eq!(addrs[0], expected);
+    }
+
+    #[test]
+    fn add_address_deduplicates() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let addr = memory_addr(1000);
+        behaviour.add_address(addr.clone());
+        behaviour.add_address(addr.clone());
+
+        assert_eq!(behaviour.observed_addresses().len(), 1);
+    }
+
+    #[test]
+    fn remove_address_works() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let addr1 = memory_addr(1000);
+        let addr2 = memory_addr(2000);
+        behaviour.add_address(addr1.clone());
+        behaviour.add_address(addr2.clone());
+        assert_eq!(behaviour.observed_addresses().len(), 2);
+
+        behaviour.remove_address(addr1);
+
+        let remaining = behaviour.observed_addresses();
+        assert_eq!(remaining.len(), 1);
+        let mut expected_addr2 = addr2;
+        expected_addr2.push(Protocol::P2p(me));
+        assert_eq!(remaining[0], expected_addr2);
+    }
+
+    #[test]
+    fn relayed_addresses_are_not_stored() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let relayed = Multiaddr::empty()
+            .with(Protocol::Memory(1000))
+            .with(Protocol::P2p(PeerId::random()))
+            .with(Protocol::P2pCircuit);
+
+        behaviour.add_address(relayed);
+        assert!(behaviour.observed_addresses().is_empty());
+    }
+
+    #[test]
+    fn empty_behaviour_returns_no_addresses() {
+        let me = peer_id();
+        let behaviour = Behaviour::new(me);
+        assert!(behaviour.observed_addresses().is_empty());
+    }
 }

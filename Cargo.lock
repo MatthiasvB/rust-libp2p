@@ -2803,7 +2803,6 @@ dependencies = [
  "libp2p-swarm-test",
  "libp2p-tcp",
  "libp2p-yamux",
- "lru",
  "quick-protobuf",
  "quick-protobuf-codec",
  "thiserror 2.0.9",
