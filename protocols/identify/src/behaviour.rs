@@ -96,8 +96,9 @@ fn extract_transport_port(addr: &Multiaddr) -> Option<u16> {
 
 /// Replace the transport-layer port (TCP or UDP) in a multiaddr.
 ///
-/// Replaces the second protocol component, which by convention is the port
-/// in standard multiaddrs (`/ip4/.../tcp/PORT` or `/ip4/.../udp/PORT/quic-v1`).
+/// Replaces the protocol at index 1, which is the transport port in standard
+/// IP-based multiaddrs like `/ip4/.../tcp/PORT` or `/ip4/.../udp/PORT/quic-v1`.
+/// Returns `None` if the protocol at index 1 is not TCP or UDP.
 fn replace_transport_port(addr: &Multiaddr, port: u16) -> Option<Multiaddr> {
     use Protocol::*;
     addr.replace(1, |proto| match proto {
@@ -368,7 +369,7 @@ impl Behaviour {
                             // inbound connection), use it instead of the listen port.
                             // This handles NAT that remaps ports.
                             if let Some(port) = known_external_port {
-                                return replace_transport_port(&addr, port).or(Some(addr));
+                                return replace_transport_port(&addr, port);
                             }
 
                             Some(addr)
