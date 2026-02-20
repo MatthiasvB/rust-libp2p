@@ -130,7 +130,13 @@ impl Behaviour {
     }
 
     fn observed_addresses(&self) -> Vec<Multiaddr> {
-        self.address_candidates.iter().cloned().collect()
+        let addrs: Vec<_> = self.address_candidates.iter().cloned().collect();
+        tracing::debug!(
+            count = addrs.len(),
+            addresses = ?addrs,
+            "Collecting hole-punch candidate addresses"
+        );
+        addrs
     }
 
     fn on_dial_failure(
@@ -413,6 +419,7 @@ impl Candidates {
 
     fn add(&mut self, mut address: Multiaddr, connection_id: ConnectionId) {
         if is_relayed(&address) {
+            tracing::trace!(%address, "Ignoring relayed address candidate");
             return;
         }
 
@@ -420,6 +427,7 @@ impl Candidates {
             address.push(Protocol::P2p(self.me));
         }
 
+        tracing::debug!(%address, ?connection_id, "Adding hole-punch address candidate");
         self.inner.push(address, connection_id);
     }
 
@@ -432,6 +440,14 @@ impl Candidates {
             .filter(|(_, cid)| **cid == connection_id)
             .map(|(addr, _)| addr.clone())
             .collect();
+        if !to_remove.is_empty() {
+            tracing::debug!(
+                ?connection_id,
+                count = to_remove.len(),
+                addresses = ?to_remove,
+                "Evicting hole-punch address candidates for closed connection"
+            );
+        }
         for addr in to_remove {
             self.inner.pop(&addr);
         }
