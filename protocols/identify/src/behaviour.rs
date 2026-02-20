@@ -87,6 +87,29 @@ fn is_tcp_addr(addr: &Multiaddr) -> bool {
     matches!(first, Ip4(_) | Ip6(_) | Dns(_) | Dns4(_) | Dns6(_)) && matches!(second, Tcp(_))
 }
 
+/// Extract the transport-layer port (TCP or UDP) from a multiaddr.
+fn extract_transport_port(addr: &Multiaddr) -> Option<u16> {
+    use Protocol::*;
+    addr.iter().find_map(|proto| match proto {
+        Tcp(port) | Udp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// Replace the transport-layer port (TCP or UDP) in a multiaddr.
+///
+/// Replaces the protocol at index 1, which is the transport port in standard
+/// IP-based multiaddrs like `/ip4/.../tcp/PORT` or `/ip4/.../udp/PORT/quic-v1`.
+/// Returns `None` if the protocol at index 1 is not TCP or UDP.
+fn replace_transport_port(addr: &Multiaddr, port: u16) -> Option<Multiaddr> {
+    use Protocol::*;
+    addr.replace(1, |proto| match proto {
+        Tcp(_) => Some(Tcp(port)),
+        Udp(_) => Some(Udp(port)),
+        _ => None,
+    })
+}
+
 /// Network behaviour that automatically identifies nodes periodically, returns information
 /// about them, and answers identify queries from other nodes.
 ///
@@ -342,6 +365,13 @@ impl Behaviour {
             // Apply address translation to the candidate address.
             // For TCP without port-reuse, the observed address contains an ephemeral port which
             // needs to be replaced by the port of a listen address.
+            //
+            // The basic `_address_translation` replaces only the IP and keeps the listen port.
+            // But behind NAT with port remapping, the listen port differs from the external port.
+            // If we know the actual external port from a port-reused or inbound connection,
+            // we use that instead.
+            let known_external_port = self.known_external_port_for(observed);
+
             let translated_addresses = {
                 let mut addrs: Vec<_> = self
                     .listen_addresses
@@ -351,7 +381,16 @@ impl Behaviour {
                             || (is_quic_addr(server, true) && is_quic_addr(observed, true))
                             || (is_quic_addr(server, false) && is_quic_addr(observed, false))
                         {
-                            _address_translation(server, observed)
+                            let addr = _address_translation(server, observed)?;
+
+                            // If we know the actual external port (from a port-reused or
+                            // inbound connection), use it instead of the listen port.
+                            // This handles NAT that remaps ports.
+                            if let Some(port) = known_external_port {
+                                return replace_transport_port(&addr, port);
+                            }
+
+                            Some(addr)
                         } else {
                             None
                         }
@@ -381,6 +420,32 @@ impl Behaviour {
         // incoming connection
         self.events
             .push_back(ToSwarm::NewExternalAddrCandidate(observed.clone()));
+    }
+
+    /// Look up the external port for the given transport type from a non-ephemeral connection.
+    ///
+    /// When a connection uses port reuse (binding to the listen port) or is an inbound connection,
+    /// the observed address contains the actual external port as seen through NAT. This port
+    /// accounts for NAT port remapping and is more accurate than the listen port.
+    fn known_external_port_for(&self, reference_addr: &Multiaddr) -> Option<u16> {
+        for (conn_id, observed_addr) in &self.our_observed_addresses {
+            // Only consider non-ephemeral connections (port-reused outbound or inbound).
+            if self
+                .outbound_connections_with_ephemeral_port
+                .contains(conn_id)
+            {
+                continue;
+            }
+
+            // Check that the transport type matches.
+            if (is_tcp_addr(reference_addr) && is_tcp_addr(observed_addr))
+                || (is_quic_addr(reference_addr, true) && is_quic_addr(observed_addr, true))
+                || (is_quic_addr(reference_addr, false) && is_quic_addr(observed_addr, false))
+            {
+                return extract_transport_port(observed_addr);
+            }
+        }
+        None
     }
 }
 
