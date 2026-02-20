@@ -385,10 +385,16 @@ impl Behaviour {
                 addrs
             };
 
-            // If address translation yielded nothing, broadcast the original candidate address.
+            // If address translation yielded nothing, the ephemeral port cannot be
+            // corrected (e.g. no matching listen address for this transport type).
+            // Don't emit the raw ephemeral-port address — it would pollute DCUtR's
+            // candidate list with useless addresses that can't be reached.
             if translated_addresses.is_empty() {
-                self.events
-                    .push_back(ToSwarm::NewExternalAddrCandidate { address: observed.clone(), connection_id });
+                tracing::debug!(
+                    %observed,
+                    ?connection_id,
+                    "Dropping untranslatable observed address with ephemeral port"
+                );
             } else {
                 for addr in translated_addresses {
                     self.events
