@@ -31,6 +31,11 @@ use libp2p_core::{multiaddr::Protocol, Multiaddr};
 /// we initiated, it will contain our dialing port, not our listening port. We need to take the ip
 /// address or dns address from the observed address and the port from the original address.
 ///
+/// **Note**: This function keeps the port from the `original` address, which is typically the
+/// listen port. Behind NAT with port remapping, the listen port may differ from the external port.
+/// Callers should use the actual external port (learned from port-reused or inbound connections)
+/// when available.
+///
 /// This is a mixed-mode translation, i.e. an IPv4 / DNS4 address may be replaced by an IPv6 / DNS6
 /// address and vice versa.
 ///
