@@ -26,6 +26,7 @@ use futures_timer::Delay;
 use libp2p_core::{multiaddr::Protocol, Multiaddr};
 use libp2p_swarm::Stream;
 use thiserror::Error;
+use tracing::debug;
 use web_time::Instant;
 
 use crate::{proto, PROTOCOL_NAME};
@@ -54,6 +55,7 @@ pub(crate) async fn handshake(
         .ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))??;
 
     let rtt = sent_time.elapsed();
+    debug!("RTT to peer is {rtt:?}");
 
     if !matches!(type_pb, proto::Type::CONNECT) {
         return Err(Error::Protocol(ProtocolViolation::UnexpectedTypeSync));
