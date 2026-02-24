@@ -123,6 +123,15 @@ pub struct Behaviour {
     /// Indexed by the [`ConnectionId`] of the relayed connection and
     /// the [`PeerId`] we are trying to establish a direct connection to.
     outgoing_direct_connection_attempts: HashMap<(ConnectionId, PeerId), u8>,
+
+    /// Peers for which a hole-punch dial is currently in progress.
+    ///
+    /// When the hole-punch succeeds, the direct connection may arrive as
+    /// **inbound** on this node (if the remote's dial won the race). In that
+    /// case, `handle_established_outbound_connection` never fires for our dial,
+    /// so we use this set to detect hole-punch success in
+    /// `handle_established_inbound_connection` as well.
+    holepunch_in_progress: HashSet<PeerId>,
 }
 
 impl Behaviour {
@@ -134,6 +143,7 @@ impl Behaviour {
             me: local_peer_id,
             direct_to_relayed_connections: Default::default(),
             outgoing_direct_connection_attempts: Default::default(),
+            holepunch_in_progress: Default::default(),
         }
     }
 
@@ -224,6 +234,7 @@ impl Behaviour {
                 event: Either::Left(handler::relayed::Command::Connect),
             })
         } else {
+            self.holepunch_in_progress.remove(&peer_id);
             self.queued_events.extend([ToSwarm::GenerateEvent(Event {
                 remote_peer_id: peer_id,
                 result: Err(Error {
@@ -293,6 +304,17 @@ impl NetworkBehaviour for Behaviour {
             "state mismatch"
         );
 
+        // If a hole-punch is in progress with this peer and we received a direct
+        // inbound connection, the remote's dial won the race. Emit a success event
+        // so the application knows the hole-punch succeeded regardless of which
+        // side's dial created the connection.
+        if self.holepunch_in_progress.remove(&peer) {
+            self.queued_events.extend([ToSwarm::GenerateEvent(Event {
+                remote_peer_id: peer,
+                result: Ok(connection_id),
+            })]);
+        }
+
         Ok(Either::Right(dummy::ConnectionHandler))
     }
 
@@ -333,6 +355,11 @@ impl NetworkBehaviour for Behaviour {
                 );
             }
 
+            // Our outbound dial succeeded. Clean up the tracking so that an
+            // inbound connection from the same peer (if both dials succeeded)
+            // doesn't emit a duplicate event.
+            self.holepunch_in_progress.remove(&peer);
+
             self.queued_events.extend([ToSwarm::GenerateEvent(Event {
                 remote_peer_id: peer,
                 result: Ok(connection_id),
@@ -372,9 +399,11 @@ impl NetworkBehaviour for Behaviour {
 
                 self.direct_to_relayed_connections
                     .insert(maybe_direct_connection_id, relayed_connection_id);
+                self.holepunch_in_progress.insert(event_source);
                 self.queued_events.push_back(ToSwarm::Dial { opts });
             }
             Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
+                self.holepunch_in_progress.remove(&event_source);
                 self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
                     remote_peer_id: event_source,
                     result: Err(Error {
@@ -383,6 +412,7 @@ impl NetworkBehaviour for Behaviour {
                 }));
             }
             Either::Left(handler::relayed::Event::OutboundConnectFailed { error }) => {
+                self.holepunch_in_progress.remove(&event_source);
                 self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
                     remote_peer_id: event_source,
                     result: Err(Error {
@@ -405,6 +435,7 @@ impl NetworkBehaviour for Behaviour {
 
                 self.direct_to_relayed_connections
                     .insert(maybe_direct_connection_id, relayed_connection_id);
+                self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
