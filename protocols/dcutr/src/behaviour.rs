@@ -118,11 +118,27 @@ pub struct Behaviour {
     /// The local peer ID, used to append `/p2p/<peer_id>` to candidate addresses.
     me: PeerId,
 
-    direct_to_relayed_connections: HashMap<ConnectionId, ConnectionId>,
+    /// Maps direct (hole-punch) connection IDs to their relayed connection ID and
+    /// a flag indicating whether the local node initiated the DCUtR upgrade.
+    ///
+    /// `locally_initiated = true` means this node is the listener on the relay
+    /// (OutboundConnect path) — local retries via `Command::Connect`.
+    /// `locally_initiated = false` means this node is the dialer on the relay
+    /// (InboundConnect path) — remote controls retries.
+    direct_to_relayed_connections: HashMap<ConnectionId, (ConnectionId, bool)>,
 
     /// Indexed by the [`ConnectionId`] of the relayed connection and
     /// the [`PeerId`] we are trying to establish a direct connection to.
     outgoing_direct_connection_attempts: HashMap<(ConnectionId, PeerId), u8>,
+
+    /// Peers for which a hole-punch dial is currently in progress.
+    ///
+    /// When the hole-punch succeeds, the direct connection may arrive as
+    /// **inbound** on this node (if the remote's dial won the race). In that
+    /// case, `handle_established_outbound_connection` never fires for our dial,
+    /// so we use this set to detect hole-punch success in
+    /// `handle_established_inbound_connection` as well.
+    holepunch_in_progress: HashSet<PeerId>,
 }
 
 impl Behaviour {
@@ -134,6 +150,7 @@ impl Behaviour {
             me: local_peer_id,
             direct_to_relayed_connections: Default::default(),
             outgoing_direct_connection_attempts: Default::default(),
+            holepunch_in_progress: Default::default(),
         }
     }
 
@@ -203,7 +220,7 @@ impl Behaviour {
             return;
         };
 
-        let Some(relayed_connection_id) = self
+        let Some(&(relayed_connection_id, locally_initiated)) = self
             .direct_to_relayed_connections
             .get(&failed_direct_connection)
         else {
@@ -212,18 +229,23 @@ impl Behaviour {
 
         let Some(attempt) = self
             .outgoing_direct_connection_attempts
-            .get(&(*relayed_connection_id, peer_id))
+            .get(&(relayed_connection_id, peer_id))
         else {
             return;
         };
 
         if *attempt < MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
-            self.queued_events.push_back(ToSwarm::NotifyHandler {
-                handler: NotifyHandler::One(*relayed_connection_id),
-                peer_id,
-                event: Either::Left(handler::relayed::Command::Connect),
-            })
+            if locally_initiated {
+                // OutboundConnect path: we control retries.
+                self.queued_events.push_back(ToSwarm::NotifyHandler {
+                    handler: NotifyHandler::One(relayed_connection_id),
+                    peer_id,
+                    event: Either::Left(handler::relayed::Command::Connect),
+                })
+            }
+            // InboundConnect path: remote controls retries, nothing to do here.
         } else {
+            self.holepunch_in_progress.remove(&peer_id);
             self.queued_events.extend([ToSwarm::GenerateEvent(Event {
                 remote_peer_id: peer_id,
                 result: Err(Error {
@@ -293,6 +315,17 @@ impl NetworkBehaviour for Behaviour {
             "state mismatch"
         );
 
+        // If a hole-punch is in progress with this peer and we received a direct
+        // inbound connection, the remote's dial won the race. Emit a success event
+        // so the application knows the hole-punch succeeded regardless of which
+        // side's dial created the connection.
+        if self.holepunch_in_progress.remove(&peer) {
+            self.queued_events.extend([ToSwarm::GenerateEvent(Event {
+                remote_peer_id: peer,
+                result: Ok(connection_id),
+            })]);
+        }
+
         Ok(Either::Right(dummy::ConnectionHandler))
     }
 
@@ -322,16 +355,27 @@ impl NetworkBehaviour for Behaviour {
             .insert(connection_id);
 
         // Whether this is a connection requested by this behaviour.
-        if let Some(&relayed_connection_id) = self.direct_to_relayed_connections.get(&connection_id)
+        if let Some(&(relayed_connection_id, locally_initiated)) =
+            self.direct_to_relayed_connections.get(&connection_id)
         {
-            if role_override == Endpoint::Listener {
+            if locally_initiated {
+                // OutboundConnect path: assert state consistency.
                 assert!(
                     self.outgoing_direct_connection_attempts
                         .remove(&(relayed_connection_id, peer))
                         .is_some(),
                     "state mismatch"
                 );
+            } else {
+                // InboundConnect path: clean up attempt tracking.
+                self.outgoing_direct_connection_attempts
+                    .remove(&(relayed_connection_id, peer));
             }
+
+            // Our outbound dial succeeded. Clean up the tracking so that an
+            // inbound connection from the same peer (if both dials succeeded)
+            // doesn't emit a duplicate event.
+            self.holepunch_in_progress.remove(&peer);
 
             self.queued_events.extend([ToSwarm::GenerateEvent(Event {
                 remote_peer_id: peer,
@@ -355,7 +399,7 @@ impl NetworkBehaviour for Behaviour {
                     // any event coming from it.
                     return;
                 }
-                Some(relayed_connection_id) => *relayed_connection_id,
+                Some(&(relayed_connection_id, _)) => relayed_connection_id,
             },
         };
 
@@ -371,10 +415,16 @@ impl NetworkBehaviour for Behaviour {
                 let maybe_direct_connection_id = opts.connection_id();
 
                 self.direct_to_relayed_connections
-                    .insert(maybe_direct_connection_id, relayed_connection_id);
+                    .insert(maybe_direct_connection_id, (relayed_connection_id, false));
+                self.holepunch_in_progress.insert(event_source);
+                *self
+                    .outgoing_direct_connection_attempts
+                    .entry((relayed_connection_id, event_source))
+                    .or_default() += 1;
                 self.queued_events.push_back(ToSwarm::Dial { opts });
             }
             Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
+                self.holepunch_in_progress.remove(&event_source);
                 self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
                     remote_peer_id: event_source,
                     result: Err(Error {
@@ -383,6 +433,7 @@ impl NetworkBehaviour for Behaviour {
                 }));
             }
             Either::Left(handler::relayed::Event::OutboundConnectFailed { error }) => {
+                self.holepunch_in_progress.remove(&event_source);
                 self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
                     remote_peer_id: event_source,
                     result: Err(Error {
@@ -404,7 +455,8 @@ impl NetworkBehaviour for Behaviour {
                 let maybe_direct_connection_id = opts.connection_id();
 
                 self.direct_to_relayed_connections
-                    .insert(maybe_direct_connection_id, relayed_connection_id);
+                    .insert(maybe_direct_connection_id, (relayed_connection_id, true));
+                self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
