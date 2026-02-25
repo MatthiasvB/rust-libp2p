@@ -47,19 +47,63 @@ use crate::{handler, protocol};
 
 pub(crate) const MAX_NUMBER_OF_UPGRADE_ATTEMPTS: u8 = 3;
 
-/// Number of rapid-fire dials per hole-punch attempt.
-///
-/// After the DCUtR CONNECT/SYNC handshake, this many dials are emitted in
-/// quick succession to increase the chance of at least one SYN packet arriving
-/// during the NAT mapping window. For QUIC, all dials share the same UDP socket
-/// (same source port) via quinn's endpoint multiplexing — a true "machine gun."
-/// For TCP, concurrent dials to the same remote may fall back to different source
-/// ports due to the TCP 4-tuple constraint, but the rapid retries still improve
-/// timing alignment with the remote peer's dials.
-const HOLE_PUNCH_BURST_COUNT: usize = 5;
+const DEFAULT_HOLE_PUNCH_BURST_COUNT: usize = 5;
+const DEFAULT_HOLE_PUNCH_BURST_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Delay between rapid-fire dials within a burst.
-const HOLE_PUNCH_BURST_INTERVAL: Duration = Duration::from_millis(200);
+/// Configuration for the DCUtR [`Behaviour`].
+///
+/// Use the builder methods to customize hole-punching parameters.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Number of rapid-fire dials per QUIC hole-punch attempt.
+    ///
+    /// After the DCUtR CONNECT/SYNC handshake, this many dials are emitted in
+    /// quick succession for QUIC addresses to increase the chance of at least one
+    /// Initial packet arriving during the NAT mapping window. All dials share the
+    /// same UDP socket (same source port) via quinn's endpoint multiplexing.
+    ///
+    /// TCP addresses always use a single dial (no burst) because concurrent dials
+    /// from the same source port hit the TCP 4-tuple constraint and fall back to
+    /// ephemeral ports, defeating hole-punching.
+    ///
+    /// Default: 5.
+    hole_punch_burst_count: usize,
+
+    /// Delay between rapid-fire QUIC dials within a burst.
+    ///
+    /// Should be a small fraction of the typical RTT (50–250 ms) so that
+    /// multiple packets arrive during the NAT mapping window.
+    ///
+    /// Default: 20 ms.
+    hole_punch_burst_interval: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            hole_punch_burst_count: DEFAULT_HOLE_PUNCH_BURST_COUNT,
+            hole_punch_burst_interval: DEFAULT_HOLE_PUNCH_BURST_INTERVAL,
+        }
+    }
+}
+
+impl Config {
+    /// Set the number of rapid-fire dials per QUIC hole-punch attempt.
+    ///
+    /// Set to 1 to disable burst dials. Only affects QUIC addresses.
+    pub fn with_hole_punch_burst_count(mut self, count: usize) -> Self {
+        self.hole_punch_burst_count = count.max(1);
+        self
+    }
+
+    /// Set the delay between rapid-fire QUIC dials within a burst.
+    ///
+    /// Should be a small fraction of the expected RTT between peers.
+    pub fn with_hole_punch_burst_interval(mut self, interval: Duration) -> Self {
+        self.hole_punch_burst_interval = interval;
+        self
+    }
+}
 
 /// The event produced by the DCUtR [`Behaviour`], delivered to the application via
 /// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
@@ -158,13 +202,16 @@ pub struct Behaviour {
     /// `handle_established_inbound_connection` as well.
     holepunch_in_progress: HashSet<PeerId>,
 
-    /// Pending rapid-fire dial bursts.
+    /// Pending rapid-fire QUIC dial bursts.
     ///
     /// Each entry contains a timer, remaining burst count, the target peer,
     /// the addresses to dial, the relayed connection ID, and whether this is
     /// a locally-initiated (OutboundConnect) or remote-initiated (InboundConnect)
     /// hole-punch.
     pending_bursts: Vec<PendingBurst>,
+
+    /// Configuration parameters.
+    config: Config,
 }
 
 /// A pending rapid-fire burst of hole-punch dials.
@@ -179,7 +226,13 @@ struct PendingBurst {
 }
 
 impl Behaviour {
+    /// Create a new DCUtR [`Behaviour`] with default configuration.
     pub fn new(local_peer_id: PeerId) -> Self {
+        Self::with_config(local_peer_id, Config::default())
+    }
+
+    /// Create a new DCUtR [`Behaviour`] with custom configuration.
+    pub fn with_config(local_peer_id: PeerId, config: Config) -> Self {
         Behaviour {
             queued_events: Default::default(),
             direct_connections: Default::default(),
@@ -189,6 +242,7 @@ impl Behaviour {
             outgoing_direct_connection_attempts: Default::default(),
             holepunch_in_progress: Default::default(),
             pending_bursts: Vec::new(),
+            config,
         }
     }
 
@@ -246,11 +300,16 @@ impl Behaviour {
         addrs
     }
 
-    /// Initiate a rapid-fire burst of hole-punch dials.
+    /// Initiate hole-punch dials, with rapid-fire bursts for QUIC addresses.
     ///
-    /// Emits the first dial immediately and schedules the remaining dials
-    /// with [`HOLE_PUNCH_BURST_INTERVAL`] delays between them.
-    fn initiate_hole_punch_burst(
+    /// Splits the address list into QUIC and non-QUIC (TCP) addresses:
+    /// - **QUIC addresses**: emits a burst of dials (configurable count and interval).
+    ///   All dials share the same UDP socket via quinn's endpoint multiplexing,
+    ///   creating a true "machine gun" of Initial packets from the same source port.
+    /// - **TCP addresses**: emits a single dial. Concurrent TCP dials to the same
+    ///   remote from the same source port hit the 4-tuple constraint and fall back
+    ///   to ephemeral ports, defeating hole-punching.
+    fn initiate_hole_punch_dials(
         &mut self,
         peer_id: PeerId,
         addresses: Vec<Multiaddr>,
@@ -258,34 +317,61 @@ impl Behaviour {
         locally_initiated: bool,
         override_role: bool,
     ) {
-        tracing::debug!(
-            target = %peer_id,
-            burst_count = HOLE_PUNCH_BURST_COUNT,
-            interval_ms = HOLE_PUNCH_BURST_INTERVAL.as_millis(),
-            "Initiating rapid-fire hole-punch burst"
-        );
+        let (quic_addrs, tcp_addrs): (Vec<_>, Vec<_>) =
+            addresses.into_iter().partition(is_quic);
 
-        // Emit the first dial immediately.
-        let opts = self.create_hole_punch_dial(
-            peer_id,
-            addresses.clone(),
-            relayed_connection_id,
-            locally_initiated,
-            override_role,
-        );
-        self.queued_events.push_back(ToSwarm::Dial { opts });
-
-        // Schedule remaining dials with delays.
-        if HOLE_PUNCH_BURST_COUNT > 1 {
-            self.pending_bursts.push(PendingBurst {
-                delay: Box::pin(Delay::new(HOLE_PUNCH_BURST_INTERVAL)),
-                remaining: HOLE_PUNCH_BURST_COUNT - 1,
+        // TCP addresses: single dial (no burst).
+        if !tcp_addrs.is_empty() {
+            tracing::debug!(
+                target = %peer_id,
+                count = tcp_addrs.len(),
+                "Hole-punch dial for TCP addresses (single shot)"
+            );
+            let opts = self.create_hole_punch_dial(
                 peer_id,
-                addresses,
+                tcp_addrs,
                 relayed_connection_id,
                 locally_initiated,
                 override_role,
-            });
+            );
+            self.queued_events.push_back(ToSwarm::Dial { opts });
+        }
+
+        // QUIC addresses: rapid-fire burst.
+        if !quic_addrs.is_empty() {
+            let burst_count = self.config.hole_punch_burst_count;
+            let burst_interval = self.config.hole_punch_burst_interval;
+
+            tracing::debug!(
+                target = %peer_id,
+                count = quic_addrs.len(),
+                burst_count,
+                interval_ms = burst_interval.as_millis(),
+                "Hole-punch burst for QUIC addresses"
+            );
+
+            // Emit the first QUIC dial immediately.
+            let opts = self.create_hole_punch_dial(
+                peer_id,
+                quic_addrs.clone(),
+                relayed_connection_id,
+                locally_initiated,
+                override_role,
+            );
+            self.queued_events.push_back(ToSwarm::Dial { opts });
+
+            // Schedule remaining burst dials with delays.
+            if burst_count > 1 {
+                self.pending_bursts.push(PendingBurst {
+                    delay: Box::pin(Delay::new(burst_interval)),
+                    remaining: burst_count - 1,
+                    peer_id,
+                    addresses: quic_addrs,
+                    relayed_connection_id,
+                    locally_initiated,
+                    override_role,
+                });
+            }
         }
     }
 
@@ -504,14 +590,14 @@ impl NetworkBehaviour for Behaviour {
 
         match handler_event {
             Either::Left(handler::relayed::Event::InboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as dialer (rapid-fire burst)");
+                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as dialer");
 
                 self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
-                self.initiate_hole_punch_burst(
+                self.initiate_hole_punch_dials(
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
@@ -540,14 +626,14 @@ impl NetworkBehaviour for Behaviour {
                 // Maybe treat these as transient and retry?
             }
             Either::Left(handler::relayed::Event::OutboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener (rapid-fire burst)");
+                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener");
 
                 self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
-                self.initiate_hole_punch_burst(
+                self.initiate_hole_punch_dials(
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
@@ -615,7 +701,7 @@ impl NetworkBehaviour for Behaviour {
 
                     // Reset timer for next burst.
                     if remaining > 0 {
-                        self.pending_bursts[i].delay = Box::pin(Delay::new(HOLE_PUNCH_BURST_INTERVAL));
+                        self.pending_bursts[i].delay = Box::pin(Delay::new(self.config.hole_punch_burst_interval));
                     }
 
                     return Poll::Ready(ToSwarm::Dial { opts });
@@ -642,6 +728,11 @@ impl NetworkBehaviour for Behaviour {
 
 fn is_relayed(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| p == Protocol::P2pCircuit)
+}
+
+fn is_quic(addr: &Multiaddr) -> bool {
+    addr.iter()
+        .any(|p| matches!(p, Protocol::QuicV1 | Protocol::Quic))
 }
 
 #[cfg(test)]
