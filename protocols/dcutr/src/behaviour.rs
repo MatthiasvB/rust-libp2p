@@ -23,10 +23,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
+    future::Future,
+    pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use either::Either;
+use futures_timer::Delay;
 use libp2p_core::{
     connection::ConnectedPoint, multiaddr::Protocol, transport::PortUse, Endpoint, Multiaddr,
 };
@@ -42,6 +46,20 @@ use thiserror::Error;
 use crate::{handler, protocol};
 
 pub(crate) const MAX_NUMBER_OF_UPGRADE_ATTEMPTS: u8 = 3;
+
+/// Number of rapid-fire dials per hole-punch attempt.
+///
+/// After the DCUtR CONNECT/SYNC handshake, this many dials are emitted in
+/// quick succession to increase the chance of at least one SYN packet arriving
+/// during the NAT mapping window. For QUIC, all dials share the same UDP socket
+/// (same source port) via quinn's endpoint multiplexing — a true "machine gun."
+/// For TCP, concurrent dials to the same remote may fall back to different source
+/// ports due to the TCP 4-tuple constraint, but the rapid retries still improve
+/// timing alignment with the remote peer's dials.
+const HOLE_PUNCH_BURST_COUNT: usize = 5;
+
+/// Delay between rapid-fire dials within a burst.
+const HOLE_PUNCH_BURST_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The event produced by the DCUtR [`Behaviour`], delivered to the application via
 /// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
@@ -139,6 +157,25 @@ pub struct Behaviour {
     /// so we use this set to detect hole-punch success in
     /// `handle_established_inbound_connection` as well.
     holepunch_in_progress: HashSet<PeerId>,
+
+    /// Pending rapid-fire dial bursts.
+    ///
+    /// Each entry contains a timer, remaining burst count, the target peer,
+    /// the addresses to dial, the relayed connection ID, and whether this is
+    /// a locally-initiated (OutboundConnect) or remote-initiated (InboundConnect)
+    /// hole-punch.
+    pending_bursts: Vec<PendingBurst>,
+}
+
+/// A pending rapid-fire burst of hole-punch dials.
+struct PendingBurst {
+    delay: Pin<Box<Delay>>,
+    remaining: usize,
+    peer_id: PeerId,
+    addresses: Vec<Multiaddr>,
+    relayed_connection_id: ConnectionId,
+    locally_initiated: bool,
+    override_role: bool,
 }
 
 impl Behaviour {
@@ -151,6 +188,7 @@ impl Behaviour {
             direct_to_relayed_connections: Default::default(),
             outgoing_direct_connection_attempts: Default::default(),
             holepunch_in_progress: Default::default(),
+            pending_bursts: Vec::new(),
         }
     }
 
@@ -206,6 +244,75 @@ impl Behaviour {
             "Collecting hole-punch candidate addresses"
         );
         addrs
+    }
+
+    /// Initiate a rapid-fire burst of hole-punch dials.
+    ///
+    /// Emits the first dial immediately and schedules the remaining dials
+    /// with [`HOLE_PUNCH_BURST_INTERVAL`] delays between them.
+    fn initiate_hole_punch_burst(
+        &mut self,
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+        relayed_connection_id: ConnectionId,
+        locally_initiated: bool,
+        override_role: bool,
+    ) {
+        tracing::debug!(
+            target = %peer_id,
+            burst_count = HOLE_PUNCH_BURST_COUNT,
+            interval_ms = HOLE_PUNCH_BURST_INTERVAL.as_millis() as u64,
+            "Initiating rapid-fire hole-punch burst"
+        );
+
+        // Emit the first dial immediately.
+        let opts = self.create_hole_punch_dial(
+            peer_id,
+            addresses.clone(),
+            relayed_connection_id,
+            locally_initiated,
+            override_role,
+        );
+        self.queued_events.push_back(ToSwarm::Dial { opts });
+
+        // Schedule remaining dials with delays.
+        if HOLE_PUNCH_BURST_COUNT > 1 {
+            self.pending_bursts.push(PendingBurst {
+                delay: Box::pin(Delay::new(HOLE_PUNCH_BURST_INTERVAL)),
+                remaining: HOLE_PUNCH_BURST_COUNT - 1,
+                peer_id,
+                addresses,
+                relayed_connection_id,
+                locally_initiated,
+                override_role,
+            });
+        }
+    }
+
+    /// Create a single hole-punch dial and register it in tracking state.
+    fn create_hole_punch_dial(
+        &mut self,
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+        relayed_connection_id: ConnectionId,
+        locally_initiated: bool,
+        override_role: bool,
+    ) -> DialOpts {
+        let mut builder = DialOpts::peer_id(peer_id)
+            .condition(dial_opts::PeerCondition::Always)
+            .addresses(addresses);
+
+        if override_role {
+            builder = builder.override_role();
+        }
+
+        let opts = builder.build();
+        let connection_id = opts.connection_id();
+
+        self.direct_to_relayed_connections
+            .insert(connection_id, (relayed_connection_id, locally_initiated));
+
+        opts
     }
 
     fn on_dial_failure(
@@ -355,32 +462,24 @@ impl NetworkBehaviour for Behaviour {
             .insert(connection_id);
 
         // Whether this is a connection requested by this behaviour.
-        if let Some(&(relayed_connection_id, locally_initiated)) =
+        if let Some(&(relayed_connection_id, _locally_initiated)) =
             self.direct_to_relayed_connections.get(&connection_id)
         {
-            if locally_initiated {
-                // OutboundConnect path: assert state consistency.
-                assert!(
-                    self.outgoing_direct_connection_attempts
-                        .remove(&(relayed_connection_id, peer))
-                        .is_some(),
-                    "state mismatch"
-                );
-            } else {
-                // InboundConnect path: clean up attempt tracking.
-                self.outgoing_direct_connection_attempts
-                    .remove(&(relayed_connection_id, peer));
+            // Clean up attempt tracking if still present.
+            // With rapid-fire bursts, multiple dials may succeed — only the first
+            // one emits an event (via holepunch_in_progress check below).
+            self.outgoing_direct_connection_attempts
+                .remove(&(relayed_connection_id, peer));
+
+            // Only emit a success event for the first successful dial.
+            // Subsequent burst dials that succeed are silently accepted
+            // (the connection is still valid, just no duplicate event).
+            if self.holepunch_in_progress.remove(&peer) {
+                self.queued_events.extend([ToSwarm::GenerateEvent(Event {
+                    remote_peer_id: peer,
+                    result: Ok(connection_id),
+                })]);
             }
-
-            // Our outbound dial succeeded. Clean up the tracking so that an
-            // inbound connection from the same peer (if both dials succeeded)
-            // doesn't emit a duplicate event.
-            self.holepunch_in_progress.remove(&peer);
-
-            self.queued_events.extend([ToSwarm::GenerateEvent(Event {
-                remote_peer_id: peer,
-                result: Ok(connection_id),
-            })]);
         }
         Ok(Either::Right(dummy::ConnectionHandler))
     }
@@ -405,23 +504,20 @@ impl NetworkBehaviour for Behaviour {
 
         match handler_event {
             Either::Left(handler::relayed::Event::InboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as dialer");
+                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as dialer (rapid-fire burst)");
 
-                let opts = DialOpts::peer_id(event_source)
-                    .addresses(remote_addrs)
-                    .condition(dial_opts::PeerCondition::Always)
-                    .build();
-
-                let maybe_direct_connection_id = opts.connection_id();
-
-                self.direct_to_relayed_connections
-                    .insert(maybe_direct_connection_id, (relayed_connection_id, false));
                 self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
-                self.queued_events.push_back(ToSwarm::Dial { opts });
+                self.initiate_hole_punch_burst(
+                    event_source,
+                    remote_addrs,
+                    relayed_connection_id,
+                    false,  // not locally initiated
+                    false,  // no role override
+                );
             }
             Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
                 self.holepunch_in_progress.remove(&event_source);
@@ -444,24 +540,20 @@ impl NetworkBehaviour for Behaviour {
                 // Maybe treat these as transient and retry?
             }
             Either::Left(handler::relayed::Event::OutboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener");
+                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener (rapid-fire burst)");
 
-                let opts = DialOpts::peer_id(event_source)
-                    .condition(dial_opts::PeerCondition::Always)
-                    .addresses(remote_addrs)
-                    .override_role()
-                    .build();
-
-                let maybe_direct_connection_id = opts.connection_id();
-
-                self.direct_to_relayed_connections
-                    .insert(maybe_direct_connection_id, (relayed_connection_id, true));
                 self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
-                self.queued_events.push_back(ToSwarm::Dial { opts });
+                self.initiate_hole_punch_burst(
+                    event_source,
+                    remote_addrs,
+                    relayed_connection_id,
+                    true,   // locally initiated
+                    true,   // override role
+                );
             }
             // TODO: remove when Rust 1.82 is MSRV
             #[allow(unreachable_patterns)]
@@ -469,10 +561,69 @@ impl NetworkBehaviour for Behaviour {
         };
     }
 
-    #[tracing::instrument(level = "trace", name = "NetworkBehaviour::poll", skip(self))]
-    fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    #[tracing::instrument(level = "trace", name = "NetworkBehaviour::poll", skip(self, cx))]
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if let Some(event) = self.queued_events.pop_front() {
             return Poll::Ready(event);
+        }
+
+        // Drive pending rapid-fire bursts.
+        // Check if any burst timer has fired and emit the next dial.
+        let mut i = 0;
+        while i < self.pending_bursts.len() {
+            if self.pending_bursts[i].remaining == 0 {
+                self.pending_bursts.swap_remove(i);
+                continue;
+            }
+
+            // If the hole-punch already succeeded for this peer, cancel remaining bursts.
+            if !self.holepunch_in_progress.contains(&self.pending_bursts[i].peer_id) {
+                tracing::debug!(
+                    peer = %self.pending_bursts[i].peer_id,
+                    remaining = self.pending_bursts[i].remaining,
+                    "Cancelling remaining burst dials — hole-punch already completed"
+                );
+                self.pending_bursts.swap_remove(i);
+                continue;
+            }
+
+            match self.pending_bursts[i].delay.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    let burst = &self.pending_bursts[i];
+                    let peer_id = burst.peer_id;
+                    let addresses = burst.addresses.clone();
+                    let relayed_connection_id = burst.relayed_connection_id;
+                    let locally_initiated = burst.locally_initiated;
+                    let override_role = burst.override_role;
+
+                    self.pending_bursts[i].remaining -= 1;
+                    let remaining = self.pending_bursts[i].remaining;
+
+                    let opts = self.create_hole_punch_dial(
+                        peer_id,
+                        addresses,
+                        relayed_connection_id,
+                        locally_initiated,
+                        override_role,
+                    );
+
+                    tracing::debug!(
+                        peer = %peer_id,
+                        remaining,
+                        "Firing burst dial"
+                    );
+
+                    // Reset timer for next burst.
+                    if remaining > 0 {
+                        self.pending_bursts[i].delay = Box::pin(Delay::new(HOLE_PUNCH_BURST_INTERVAL));
+                    }
+
+                    return Poll::Ready(ToSwarm::Dial { opts });
+                }
+                Poll::Pending => {
+                    i += 1;
+                }
+            }
         }
 
         Poll::Pending
