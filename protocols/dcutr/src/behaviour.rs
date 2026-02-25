@@ -261,7 +261,7 @@ impl Behaviour {
         tracing::debug!(
             target = %peer_id,
             burst_count = HOLE_PUNCH_BURST_COUNT,
-            interval_ms = HOLE_PUNCH_BURST_INTERVAL.as_millis() as u64,
+            interval_ms = HOLE_PUNCH_BURST_INTERVAL.as_millis(),
             "Initiating rapid-fire hole-punch burst"
         );
 
