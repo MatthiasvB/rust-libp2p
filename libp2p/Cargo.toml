@@ -15,6 +15,7 @@ full = [
     "autonat",
     "cbor",
     "dcutr",
+    "machine-gun-dcutr",
     "dns",
     "ecdsa",
     "ed25519",
@@ -54,6 +55,7 @@ full = [
 autonat = ["dep:libp2p-autonat"]
 cbor = ["libp2p-request-response?/cbor"]
 dcutr = ["dep:libp2p-dcutr", "libp2p-metrics?/dcutr"]
+machine-gun-dcutr = ["dep:libp2p-machine-gun-dcutr"]
 dns = ["dep:libp2p-dns"]
 ecdsa = ["libp2p-identity/ecdsa"]
 ed25519 = ["libp2p-identity/ed25519"]
@@ -102,6 +104,7 @@ libp2p-autonat = { workspace = true, optional = true }
 libp2p-connection-limits = { workspace = true }
 libp2p-core = { workspace = true }
 libp2p-dcutr = { workspace = true, optional = true }
+libp2p-machine-gun-dcutr = { workspace = true, optional = true }
 libp2p-floodsub = { workspace = true, optional = true }
 libp2p-gossipsub = { workspace = true, optional = true }
 libp2p-identify = { workspace = true, optional = true }

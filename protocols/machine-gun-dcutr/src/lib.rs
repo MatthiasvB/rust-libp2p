@@ -33,7 +33,7 @@ mod proto {
     pub(crate) use self::holepunch::pb::{mod_HolePunch::*, HolePunch};
 }
 
-pub use behaviour::{Behaviour, Error, Event};
+pub use behaviour::{Behaviour, Config, Error, Event};
 pub use protocol::PROTOCOL_NAME;
 pub mod inbound {
     pub use crate::protocol::inbound::ProtocolViolation;

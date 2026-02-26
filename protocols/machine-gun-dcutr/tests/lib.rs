@@ -24,7 +24,7 @@ use libp2p_core::{
     multiaddr::{Multiaddr, Protocol},
     transport::{upgrade::Version, MemoryTransport, Transport},
 };
-use libp2p_dcutr as dcutr;
+use libp2p_machine_gun_dcutr as dcutr;
 use libp2p_identify as identify;
 use libp2p_identity as identity;
 use libp2p_identity::PeerId;
@@ -47,7 +47,7 @@ async fn connect() {
     // Have all swarms listen on a local TCP address.
     let (_, relay_tcp_addr) = relay.listen().with_tcp_addr_external().await;
     let (_, dst_tcp_addr) = dst.listen().await;
-    src.listen().await;
+    let (_, src_tcp_addr) = src.listen().await;
 
     assert!(src.external_addresses().next().is_none());
     assert!(dst.external_addresses().next().is_none());
@@ -62,6 +62,15 @@ async fn connect() {
         .with(Protocol::P2pCircuit)
         .with(Protocol::P2p(dst_peer_id));
     dst.listen_on(dst_relayed_addr.clone()).unwrap();
+
+    // Explicitly add hole-punch candidate addresses.
+    // In a real application, these would be correlated with relay connections.
+    dst.behaviour_mut()
+        .dcutr
+        .add_address(dst_tcp_addr.clone());
+    src.behaviour_mut()
+        .dcutr
+        .add_address(src_tcp_addr);
 
     wait_for_reservation(
         &mut dst,
@@ -101,7 +110,7 @@ async fn connect() {
 }
 
 fn build_relay() -> Swarm<Relay> {
-    Swarm::new_ephemeral_tokio(|identity| {
+    Swarm::new_ephemeral(|identity| {
         let local_peer_id = identity.public().to_peer_id();
 
         Relay {
@@ -135,7 +144,7 @@ fn build_client() -> Swarm<Client> {
 
     let transport = relay_transport
         .or_transport(MemoryTransport::default())
-        .or_transport(libp2p_tcp::tokio::Transport::default())
+        .or_transport(libp2p_tcp::async_io::Transport::default())
         .upgrade(Version::V1)
         .authenticate(plaintext::Config::new(&local_key))
         .multiplex(libp2p_yamux::Config::default())
@@ -152,7 +161,7 @@ fn build_client() -> Swarm<Client> {
             )),
         },
         local_peer_id,
-        Config::with_tokio_executor(),
+        Config::with_async_std_executor(),
     )
 }
 
