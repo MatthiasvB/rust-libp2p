@@ -18,26 +18,10 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-//! Implementation of the [libp2p Direct Connection Upgrade through Relay
-//! specification](https://github.com/libp2p/specs/blob/master/relay/DCUtR.md).
+use libp2p_swarm::StreamProtocol;
 
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+pub(crate) mod inbound;
+pub(crate) mod outbound;
+pub const PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/libp2p/machine-gun-dcutr");
 
-mod behaviour;
-mod handler;
-mod protocol;
-
-mod proto {
-    #![allow(unreachable_pub)]
-    include!("generated/mod.rs");
-    pub(crate) use self::holepunch::pb::{mod_HolePunch::*, HolePunch};
-}
-
-pub use behaviour::{Behaviour, Error, Event};
-pub use protocol::PROTOCOL_NAME;
-pub mod inbound {
-    pub use crate::protocol::inbound::ProtocolViolation;
-}
-pub mod outbound {
-    pub use crate::protocol::outbound::ProtocolViolation;
-}
+const MAX_MESSAGE_SIZE_BYTES: usize = 4096;

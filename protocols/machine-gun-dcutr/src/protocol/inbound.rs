@@ -22,13 +22,11 @@ use std::io;
 
 use asynchronous_codec::Framed;
 use futures::prelude::*;
-use futures_timer::Delay;
 use libp2p_core::{multiaddr::Protocol, Multiaddr};
 use libp2p_swarm::Stream;
 use thiserror::Error;
-use web_time::Instant;
 
-use crate::{proto, PROTOCOL_NAME};
+use crate::proto;
 
 pub(crate) async fn handshake(
     stream: Stream,
@@ -39,29 +37,14 @@ pub(crate) async fn handshake(
         quick_protobuf_codec::Codec::new(super::MAX_MESSAGE_SIZE_BYTES),
     );
 
-    let msg = proto::HolePunch {
-        type_pb: proto::Type::CONNECT,
-        ObsAddrs: candidates.into_iter().map(|a| a.to_vec()).collect(),
-    };
-
-    stream.send(msg).await?;
-
-    let sent_time = Instant::now();
-
     let proto::HolePunch { type_pb, ObsAddrs } = stream
         .next()
         .await
         .ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))??;
 
-    let rtt = sent_time.elapsed();
-
-    if !matches!(type_pb, proto::Type::CONNECT) {
-        return Err(Error::Protocol(ProtocolViolation::UnexpectedTypeSync));
-    }
-
     if ObsAddrs.is_empty() {
         return Err(Error::Protocol(ProtocolViolation::NoAddresses));
-    }
+    };
 
     let obs_addrs = ObsAddrs
         .into_iter()
@@ -83,14 +66,24 @@ pub(crate) async fn handshake(
         })
         .collect();
 
+    if !matches!(type_pb, proto::Type::CONNECT) {
+        return Err(Error::Protocol(ProtocolViolation::UnexpectedTypeSync));
+    }
+
     let msg = proto::HolePunch {
-        type_pb: proto::Type::SYNC,
-        ObsAddrs: vec![],
+        type_pb: proto::Type::CONNECT,
+        ObsAddrs: candidates.into_iter().map(|a| a.to_vec()).collect(),
     };
 
     stream.send(msg).await?;
+    let proto::HolePunch { type_pb, .. } = stream
+        .next()
+        .await
+        .ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))??;
 
-    Delay::new(rtt / 2).await;
+    if !matches!(type_pb, proto::Type::SYNC) {
+        return Err(Error::Protocol(ProtocolViolation::UnexpectedTypeConnect));
+    }
 
     Ok(obs_addrs)
 }
@@ -99,8 +92,6 @@ pub(crate) async fn handshake(
 pub enum Error {
     #[error("IO error")]
     Io(#[from] io::Error),
-    #[error("Remote does not support the `{PROTOCOL_NAME}` protocol")]
-    Unsupported,
     #[error("Protocol error")]
     Protocol(#[from] ProtocolViolation),
 }
@@ -115,20 +106,12 @@ impl From<quick_protobuf_codec::Error> for Error {
 pub enum ProtocolViolation {
     #[error(transparent)]
     Codec(#[from] quick_protobuf_codec::Error),
-    #[error("Expected 'status' field to be set.")]
-    MissingStatusField,
-    #[error("Expected 'reservation' field to be set.")]
-    MissingReservationField,
     #[error("Expected at least one address in reservation.")]
     NoAddresses,
-    #[error("Invalid expiration timestamp in reservation.")]
-    InvalidReservationExpiration,
     #[error("Failed to parse response type field.")]
     ParseTypeField,
     #[error("Unexpected message type 'connect'")]
     UnexpectedTypeConnect,
     #[error("Unexpected message type 'sync'")]
     UnexpectedTypeSync,
-    #[error("Failed to parse response type field.")]
-    ParseStatusField,
 }

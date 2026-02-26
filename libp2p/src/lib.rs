@@ -48,6 +48,9 @@ pub use libp2p_core::multihash;
 #[cfg(feature = "dcutr")]
 #[doc(inline)]
 pub use libp2p_dcutr as dcutr;
+#[cfg(feature = "machine-gun-dcutr")]
+#[doc(inline)]
+pub use libp2p_machine_gun_dcutr as machine_gun_dcutr;
 #[cfg(feature = "dns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
 #[cfg(not(target_arch = "wasm32"))]
