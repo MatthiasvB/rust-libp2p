@@ -2583,7 +2583,6 @@ dependencies = [
  "libp2p-swarm-test",
  "libp2p-tcp",
  "libp2p-yamux",
- "lru",
  "quick-protobuf",
  "quick-protobuf-codec",
  "thiserror 2.0.12",
@@ -2765,11 +2764,11 @@ dependencies = [
  "libp2p-yamux",
  "quick-protobuf",
  "quick-protobuf-codec",
- "thiserror 2.0.9",
+ "thiserror 2.0.12",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "web-time 1.1.0",
+ "web-time",
 ]
 
 [[package]]
