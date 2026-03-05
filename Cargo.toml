@@ -6,6 +6,7 @@ members = [
     "examples/browser-webrtc",
     "examples/chat",
     "examples/dcutr",
+    "examples/machine-gun-dcutr",
     "examples/distributed-key-value-store",
     "examples/file-sharing",
     "examples/identify",

@@ -60,7 +60,6 @@ pub enum Event {
 }
 
 pub struct Handler {
-    endpoint: ConnectedPoint,
     /// Queue of events to return when polled.
     queued_events: VecDeque<
         ConnectionHandlerEvent<
@@ -83,9 +82,8 @@ pub struct Handler {
 }
 
 impl Handler {
-    pub fn new(endpoint: ConnectedPoint, holepunch_candidates: Vec<Multiaddr>) -> Self {
+    pub fn new(_endpoint: ConnectedPoint, holepunch_candidates: Vec<Multiaddr>) -> Self {
         Self {
-            endpoint,
             queued_events: Default::default(),
             inbound_stream: futures_bounded::FuturesSet::new(Duration::from_secs(10), 1),
             outbound_stream: futures_bounded::FuturesSet::new(Duration::from_secs(10), 1),
@@ -129,10 +127,6 @@ impl Handler {
             protocol: stream, ..
         }: FullyNegotiatedOutbound<<Self as ConnectionHandler>::OutboundProtocol>,
     ) {
-        assert!(
-            self.endpoint.is_listener(),
-            "A connection dialer never initiates a connection upgrade."
-        );
         if self
             .outbound_stream
             .try_push(outbound::handshake(
@@ -191,19 +185,9 @@ impl ConnectionHandler for Handler {
     type InboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol> {
-        match self.endpoint {
-            ConnectedPoint::Dialer { .. } => {
-                SubstreamProtocol::new(Either::Left(ReadyUpgrade::new(PROTOCOL_NAME)), ())
-            }
-            ConnectedPoint::Listener { .. } => {
-                // By the protocol specification the listening side of a relayed connection
-                // initiates the _direct connection upgrade_. In other words the listening side of
-                // the relayed connection opens a substream to the dialing side. (Connection roles
-                // and substream roles are reversed.) The listening side on a relayed connection
-                // never expects incoming substreams, hence the denied upgrade below.
-                SubstreamProtocol::new(Either::Right(DeniedUpgrade), ())
-            }
-        }
+        // Both sides of a relayed connection accept inbound DCUtR substreams so
+        // that either side can initiate a direct connection upgrade.
+        SubstreamProtocol::new(Either::Left(ReadyUpgrade::new(PROTOCOL_NAME)), ())
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {

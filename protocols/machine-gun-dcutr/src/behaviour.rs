@@ -210,6 +210,28 @@ pub struct Behaviour {
     /// hole-punch.
     pending_bursts: Vec<PendingBurst>,
 
+    /// Peers for which the application has expressed interest in a direct
+    /// connection. Hole-punching is only initiated for peers in this set.
+    ///
+    /// Use [`Behaviour::register_interest`] and [`Behaviour::deregister_interest`]
+    /// to manage this set.
+    interested_peers: HashSet<PeerId>,
+
+    /// Active relayed connections, indexed by remote peer ID.
+    ///
+    /// Used to initiate hole-punching on existing relayed connections when
+    /// interest is registered after the connection is already established.
+    relayed_connections: HashMap<PeerId, HashSet<ConnectionId>>,
+
+    /// Tracks the local node's role on each relayed connection.
+    ///
+    /// `true` means the local node is the **listener** on the relay (i.e. the
+    /// remote dialled us via the relay). This determines the `override_role`
+    /// flag on the direct connection: the listener on the relay uses
+    /// `override_role = true` to take the listener role on the direct
+    /// connection as well, regardless of who initiated the DCUtR substream.
+    relayed_connection_is_listener: HashMap<ConnectionId, bool>,
+
     /// Configuration parameters.
     config: Config,
 }
@@ -242,6 +264,9 @@ impl Behaviour {
             outgoing_direct_connection_attempts: Default::default(),
             holepunch_in_progress: Default::default(),
             pending_bursts: Vec::new(),
+            interested_peers: Default::default(),
+            relayed_connections: Default::default(),
+            relayed_connection_is_listener: Default::default(),
             config,
         }
     }
@@ -287,6 +312,62 @@ impl Behaviour {
         if let Some(pos) = self.address_candidates.iter().position(|a| *a == address) {
             tracing::debug!(%address, "Removing hole-punch address candidate");
             self.address_candidates.swap_remove(pos);
+        }
+    }
+
+    /// Register interest in a direct connection with `peer_id`.
+    ///
+    /// Hole-punching is only attempted for peers that have been registered via
+    /// this method. If a relayed connection to the peer already exists,
+    /// hole-punching is initiated immediately. Otherwise, it will be initiated
+    /// when a relayed connection is established in the future.
+    ///
+    /// Both sides of a relayed connection can register interest independently.
+    /// The protocol is symmetric: either side can initiate, and concurrent
+    /// initiations are handled safely.
+    ///
+    /// If a hole-punch is already in progress or a direct connection to the
+    /// peer already exists, the interest is recorded but no new attempt is
+    /// started. Calling this method multiple times for the same peer is a
+    /// no-op.
+    pub fn register_interest(&mut self, peer_id: PeerId) {
+        if !self.interested_peers.insert(peer_id) {
+            return; // Already registered.
+        }
+
+        tracing::debug!(%peer_id, "Registered interest in direct connection");
+
+        // Don't initiate if already in progress or we already have a direct connection.
+        if self.holepunch_in_progress.contains(&peer_id)
+            || self.direct_connections.contains_key(&peer_id)
+        {
+            return;
+        }
+
+        // Initiate on an existing relayed connection, if any.
+        if let Some(connection_ids) = self.relayed_connections.get(&peer_id) {
+            if let Some(&connection_id) = connection_ids.iter().next() {
+                tracing::debug!(
+                    %peer_id,
+                    %connection_id,
+                    "Initiating hole-punch on existing relayed connection"
+                );
+                self.queued_events.push_back(ToSwarm::NotifyHandler {
+                    handler: NotifyHandler::One(connection_id),
+                    peer_id,
+                    event: Either::Left(handler::relayed::Command::Connect),
+                });
+            }
+        }
+    }
+
+    /// Deregister interest in a direct connection with `peer_id`.
+    ///
+    /// Any hole-punching attempt already in progress will be allowed to
+    /// complete, but no new attempts will be started for this peer.
+    pub fn deregister_interest(&mut self, peer_id: PeerId) {
+        if self.interested_peers.remove(&peer_id) {
+            tracing::debug!(%peer_id, "Deregistered interest in direct connection");
         }
     }
 
@@ -457,7 +538,16 @@ impl Behaviour {
             ..
         }: ConnectionClosed,
     ) {
-        if !connected_point.is_relayed() {
+        if connected_point.is_relayed() {
+            // Clean up relayed connection tracking.
+            self.relayed_connection_is_listener.remove(&connection_id);
+            if let Some(connections) = self.relayed_connections.get_mut(&peer_id) {
+                connections.remove(&connection_id);
+                if connections.is_empty() {
+                    self.relayed_connections.remove(&peer_id);
+                }
+            }
+        } else {
             let connections = self
                 .direct_connections
                 .get_mut(&peer_id)
@@ -491,7 +581,23 @@ impl NetworkBehaviour for Behaviour {
             };
             let mut handler =
                 handler::relayed::Handler::new(connected_point, self.observed_addresses());
-            handler.on_behaviour_event(handler::relayed::Command::Connect);
+
+            // Track this relayed connection for late interest registration.
+            // Local node is the listener on the relay.
+            self.relayed_connections
+                .entry(peer)
+                .or_default()
+                .insert(connection_id);
+            self.relayed_connection_is_listener
+                .insert(connection_id, true);
+
+            // Only initiate hole-punching if the application has registered interest.
+            if self.interested_peers.contains(&peer)
+                && !self.holepunch_in_progress.contains(&peer)
+                && !self.direct_connections.contains_key(&peer)
+            {
+                handler.on_behaviour_event(handler::relayed::Command::Connect);
+            }
 
             // TODO: We could make two `handler::relayed::Handler` here, one inbound one outbound.
             return Ok(Either::Left(handler));
@@ -531,15 +637,35 @@ impl NetworkBehaviour for Behaviour {
         port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         if is_relayed(addr) {
-            return Ok(Either::Left(handler::relayed::Handler::new(
+            let mut handler = handler::relayed::Handler::new(
                 ConnectedPoint::Dialer {
                     address: addr.clone(),
                     role_override,
                     port_use,
                 },
                 self.observed_addresses(),
-            ))); // TODO: We could make two `handler::relayed::Handler` here, one inbound one
-                 // outbound.
+            );
+
+            // Track this relayed connection for late interest registration.
+            // Local node is the dialer on the relay.
+            self.relayed_connections
+                .entry(peer)
+                .or_default()
+                .insert(connection_id);
+            self.relayed_connection_is_listener
+                .insert(connection_id, false);
+
+            // Initiate hole-punching if the application has registered interest.
+            if self.interested_peers.contains(&peer)
+                && !self.holepunch_in_progress.contains(&peer)
+                && !self.direct_connections.contains_key(&peer)
+            {
+                handler.on_behaviour_event(handler::relayed::Command::Connect);
+            }
+
+            return Ok(Either::Left(handler));
+            // TODO: We could make two `handler::relayed::Handler` here, one inbound one
+            // outbound.
         }
 
         self.direct_connections
@@ -590,19 +716,35 @@ impl NetworkBehaviour for Behaviour {
 
         match handler_event {
             Either::Left(handler::relayed::Event::InboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as dialer");
+                // The remote peer initiated the DCUtR substream. Determine the
+                // direct connection role from the relay connection role, not the
+                // substream initiator.
+                let is_relay_listener = self
+                    .relayed_connection_is_listener
+                    .get(&relayed_connection_id)
+                    .copied()
+                    .unwrap_or(false);
+
+                tracing::debug!(
+                    target=%event_source,
+                    addresses=?remote_addrs,
+                    is_relay_listener,
+                    "Attempting to hole-punch (remote initiated DCUtR)"
+                );
 
                 self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
+                let locally_initiated = false;
+                let override_role = is_relay_listener;
                 self.initiate_hole_punch_dials(
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
-                    false,  // not locally initiated
-                    false,  // no role override
+                    locally_initiated,
+                    override_role,
                 );
             }
             Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
@@ -626,19 +768,34 @@ impl NetworkBehaviour for Behaviour {
                 // Maybe treat these as transient and retry?
             }
             Either::Left(handler::relayed::Event::OutboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener");
+                // We initiated the DCUtR substream. Determine the direct
+                // connection role from the relay connection role.
+                let is_relay_listener = self
+                    .relayed_connection_is_listener
+                    .get(&relayed_connection_id)
+                    .copied()
+                    .unwrap_or(false);
+
+                tracing::debug!(
+                    target=%event_source,
+                    addresses=?remote_addrs,
+                    is_relay_listener,
+                    "Attempting to hole-punch (locally initiated DCUtR)"
+                );
 
                 self.holepunch_in_progress.insert(event_source);
                 *self
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
+                let locally_initiated = true;
+                let override_role = is_relay_listener;
                 self.initiate_hole_punch_dials(
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
-                    true,   // locally initiated
-                    true,   // override role
+                    locally_initiated,
+                    override_role,
                 );
             }
             // TODO: remove when Rust 1.82 is MSRV
@@ -815,5 +972,135 @@ mod tests {
         let me = peer_id();
         let behaviour = Behaviour::new(me);
         assert!(behaviour.observed_addresses().is_empty());
+    }
+
+    #[test]
+    fn register_interest_adds_peer() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        behaviour.register_interest(remote);
+
+        assert!(behaviour.interested_peers.contains(&remote));
+    }
+
+    #[test]
+    fn register_interest_is_idempotent() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        behaviour.register_interest(remote);
+        behaviour.register_interest(remote);
+
+        assert!(behaviour.interested_peers.contains(&remote));
+        // No duplicate events should be queued.
+        assert!(behaviour.queued_events.is_empty());
+    }
+
+    #[test]
+    fn deregister_interest_removes_peer() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        behaviour.register_interest(remote);
+        assert!(behaviour.interested_peers.contains(&remote));
+
+        behaviour.deregister_interest(remote);
+        assert!(!behaviour.interested_peers.contains(&remote));
+    }
+
+    #[test]
+    fn deregister_interest_noop_for_unknown_peer() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        behaviour.deregister_interest(remote);
+        // Should not panic.
+        assert!(!behaviour.interested_peers.contains(&remote));
+    }
+
+    #[test]
+    fn register_interest_queues_connect_for_existing_relayed_connection() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        let conn_id = ConnectionId::new_unchecked(42);
+
+        // Simulate an existing relayed connection.
+        behaviour
+            .relayed_connections
+            .entry(remote)
+            .or_default()
+            .insert(conn_id);
+
+        behaviour.register_interest(remote);
+
+        // Should have queued a NotifyHandler event with Command::Connect.
+        assert_eq!(behaviour.queued_events.len(), 1);
+        match &behaviour.queued_events[0] {
+            ToSwarm::NotifyHandler {
+                peer_id,
+                handler: NotifyHandler::One(cid),
+                ..
+            } => {
+                assert_eq!(*peer_id, remote);
+                assert_eq!(*cid, conn_id);
+            }
+            other => panic!("Expected NotifyHandler, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_interest_no_connect_when_already_direct() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        let relay_conn_id = ConnectionId::new_unchecked(42);
+        let direct_conn_id = ConnectionId::new_unchecked(43);
+
+        // Simulate existing relayed and direct connections.
+        behaviour
+            .relayed_connections
+            .entry(remote)
+            .or_default()
+            .insert(relay_conn_id);
+        behaviour
+            .direct_connections
+            .entry(remote)
+            .or_default()
+            .insert(direct_conn_id);
+
+        behaviour.register_interest(remote);
+
+        // Should not queue any events since we already have a direct connection.
+        assert!(behaviour.queued_events.is_empty());
+    }
+
+    #[test]
+    fn register_interest_no_connect_when_holepunch_in_progress() {
+        let me = peer_id();
+        let mut behaviour = Behaviour::new(me);
+
+        let remote = peer_id();
+        let conn_id = ConnectionId::new_unchecked(42);
+
+        // Simulate existing relayed connection and in-progress hole-punch.
+        behaviour
+            .relayed_connections
+            .entry(remote)
+            .or_default()
+            .insert(conn_id);
+        behaviour.holepunch_in_progress.insert(remote);
+
+        behaviour.register_interest(remote);
+
+        // Should not queue any events since hole-punch is already in progress.
+        assert!(behaviour.queued_events.is_empty());
     }
 }

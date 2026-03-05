@@ -26,7 +26,7 @@ use clap::Parser;
 use futures::{executor::block_on, future::FutureExt, stream::StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, identity, noise, ping, relay,
+    identify, identity, machine_gun_dcutr as dcutr, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId,
 };
@@ -172,11 +172,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match opts.mode {
         Mode::Dial => {
+            let remote_peer_id = opts.remote_peer_id.unwrap();
+
+            // Register interest in a direct connection with the remote peer.
+            // Hole-punching will be initiated when the relayed connection is established.
+            swarm
+                .behaviour_mut()
+                .dcutr
+                .register_interest(remote_peer_id);
+
             swarm
                 .dial(
                     opts.relay_address
                         .with(Protocol::P2pCircuit)
-                        .with(Protocol::P2p(opts.remote_peer_id.unwrap())),
+                        .with(Protocol::P2p(remote_peer_id)),
                 )
                 .unwrap();
         }
@@ -213,6 +222,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     peer_id, endpoint, ..
                 } => {
                     tracing::info!(peer=%peer_id, ?endpoint, "Established new connection");
+
+                    // In Listen mode, register interest in any peer that connects
+                    // via a relay so that hole-punching is initiated for them too.
+                    if endpoint.is_relayed() && opts.mode == Mode::Listen {
+                        tracing::info!(peer=%peer_id, "Registering interest in direct connection");
+                        swarm
+                            .behaviour_mut()
+                            .dcutr
+                            .register_interest(peer_id);
+                    }
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     tracing::info!(peer=?peer_id, "Outgoing connection failed: {error}");
