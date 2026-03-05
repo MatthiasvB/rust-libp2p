@@ -325,6 +325,11 @@ impl Behaviour {
     /// Both sides of a relayed connection can register interest independently.
     /// The protocol is symmetric: either side can initiate, and concurrent
     /// initiations are handled safely.
+    ///
+    /// If a hole-punch is already in progress or a direct connection to the
+    /// peer already exists, the interest is recorded but no new attempt is
+    /// started. Calling this method multiple times for the same peer is a
+    /// no-op.
     pub fn register_interest(&mut self, peer_id: PeerId) {
         if !self.interested_peers.insert(peer_id) {
             return; // Already registered.
@@ -360,8 +365,8 @@ impl Behaviour {
     ///
     /// Any hole-punching attempt already in progress will be allowed to
     /// complete, but no new attempts will be started for this peer.
-    pub fn deregister_interest(&mut self, peer_id: &PeerId) {
-        if self.interested_peers.remove(peer_id) {
+    pub fn deregister_interest(&mut self, peer_id: PeerId) {
+        if self.interested_peers.remove(&peer_id) {
             tracing::debug!(%peer_id, "Deregistered interest in direct connection");
         }
     }
@@ -732,12 +737,14 @@ impl NetworkBehaviour for Behaviour {
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
+                let locally_initiated = false;
+                let override_role = is_relay_listener;
                 self.initiate_hole_punch_dials(
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
-                    false,              // not locally initiated (remote opened the substream)
-                    is_relay_listener,  // override role based on relay role
+                    locally_initiated,
+                    override_role,
                 );
             }
             Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
@@ -781,12 +788,14 @@ impl NetworkBehaviour for Behaviour {
                     .outgoing_direct_connection_attempts
                     .entry((relayed_connection_id, event_source))
                     .or_default() += 1;
+                let locally_initiated = true;
+                let override_role = is_relay_listener;
                 self.initiate_hole_punch_dials(
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
-                    true,               // locally initiated (we opened the substream)
-                    is_relay_listener,  // override role based on relay role
+                    locally_initiated,
+                    override_role,
                 );
             }
             // TODO: remove when Rust 1.82 is MSRV
@@ -999,7 +1008,7 @@ mod tests {
         behaviour.register_interest(remote);
         assert!(behaviour.interested_peers.contains(&remote));
 
-        behaviour.deregister_interest(&remote);
+        behaviour.deregister_interest(remote);
         assert!(!behaviour.interested_peers.contains(&remote));
     }
 
@@ -1009,7 +1018,7 @@ mod tests {
         let mut behaviour = Behaviour::new(me);
 
         let remote = peer_id();
-        behaviour.deregister_interest(&remote);
+        behaviour.deregister_interest(remote);
         // Should not panic.
         assert!(!behaviour.interested_peers.contains(&remote));
     }
