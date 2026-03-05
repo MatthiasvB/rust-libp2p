@@ -1,9 +1,19 @@
+## 0.48.0
+
+- Remove `async_std` dependency [PR 5958](https://github.com/libp2p/rust-libp2p/pull/5958)
+
+<!-- Update to libp2p-swarm v0.47.0 -->
+
 ## 0.47.0
 
 - Emit `ToSwarm::NewExternalAddrOfPeer` on discovery.
   See [PR 5753](https://github.com/libp2p/rust-libp2p/pull/5753)
 - Upgrade `hickory-proto`.
   See [PR 5727](https://github.com/libp2p/rust-libp2p/pull/5727)
+- Fix mDNS to only advertise listening addresses that match the interface IP.
+  Previously, all listening addresses (including loopback and addresses from other interfaces)
+  were sent in mDNS responses, causing dial failures when peers tried to connect via
+  unreachable addresses.
 
 <!-- Update to libp2p-core v0.43.0 -->
 

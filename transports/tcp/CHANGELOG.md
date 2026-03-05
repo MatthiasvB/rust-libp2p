@@ -1,3 +1,12 @@
+## 0.44.1
+- Expose `socket2`'s `set_linger` config option.
+  See [PR 6225](https://github.com/libp2p/rust-libp2p/pull/5955)
+
+## 0.44.0
+
+- Remove `async-std` support.
+  See [PR 5955](https://github.com/libp2p/rust-libp2p/pull/5955)
+
 ## 0.43.0
 
 - Fix the disabling of Nagle's algorithm, which requires setting `TCP_NODELAY` to _true_.

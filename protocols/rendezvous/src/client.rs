@@ -160,34 +160,92 @@ pub enum RegisterError {
     FailedToMakeRecord(#[from] SigningError),
 }
 
+/// Events emitted by the rendezvous **client** [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The rendezvous protocol provides a lightweight peer discovery mechanism. A client can
+/// **register** with a rendezvous server to make itself discoverable, and **discover** other
+/// peers that have registered under a specific namespace.
+///
+/// # Event Lifecycle
+///
+/// ## Discovery Flow
+///
+/// 1. The application calls [`Behaviour::discover`] to find peers registered at a
+///    rendezvous node.
+/// 2. **On success**: [`Event::Discovered`] is emitted with the list of registrations and
+///    a [`Cookie`] that can be used for subsequent incremental discoveries.
+/// 3. **On failure**: [`Event::DiscoverFailed`] is emitted with an error code.
+///
+/// ## Registration Flow
+///
+/// 1. The application calls [`Behaviour::register`] to register with a rendezvous node.
+/// 2. **On success**: [`Event::Registered`] is emitted with the TTL and namespace.
+/// 3. **On failure**: [`Event::RegisterFailed`] is emitted with an error code.
+///
+/// ## Expiration
+///
+/// - [`Event::Expired`]: Emitted when a previously discovered peer's registration has
+///   expired (based on the TTL received during discovery).
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
-    /// We successfully discovered other nodes with using the contained rendezvous node.
+    /// Peer discovery succeeded at a rendezvous node.
+    ///
+    /// Contains the list of registrations (peer addresses and metadata) discovered.
+    /// The `cookie` should be stored and passed to subsequent [`Behaviour::discover`]
+    /// calls for incremental discovery (only new registrations since the cookie will be
+    /// returned).
     Discovered {
+        /// The rendezvous node that served the discovery request.
         rendezvous_node: PeerId,
+        /// The list of peer registrations discovered.
         registrations: Vec<Registration>,
+        /// An opaque cookie for incremental discovery. Pass this to the next
+        /// [`Behaviour::discover`] call to only receive new registrations.
         cookie: Cookie,
     },
-    /// We failed to discover other nodes on the contained rendezvous node.
+    /// Peer discovery failed at a rendezvous node.
+    ///
+    /// The rendezvous node was unable to serve the discovery request. This may happen
+    /// if the namespace is invalid or the server encountered an internal error.
     DiscoverFailed {
+        /// The rendezvous node that was queried.
         rendezvous_node: PeerId,
+        /// The namespace that was queried, if any.
         namespace: Option<Namespace>,
+        /// The error code returned by the rendezvous node.
         error: ErrorCode,
     },
-    /// We successfully registered with the contained rendezvous node.
+    /// Registration with a rendezvous node succeeded.
+    ///
+    /// This node is now discoverable by other peers querying the same namespace on
+    /// the same rendezvous node. The registration will remain active for `ttl` seconds,
+    /// after which it must be renewed.
     Registered {
+        /// The rendezvous node where the registration was made.
         rendezvous_node: PeerId,
+        /// The time-to-live (in seconds) of the registration.
         ttl: Ttl,
+        /// The namespace under which this node was registered.
         namespace: Namespace,
     },
-    /// We failed to register with the contained rendezvous node.
+    /// Registration with a rendezvous node failed.
+    ///
+    /// The rendezvous node refused the registration. This may happen if the namespace
+    /// is invalid, the server is at capacity, or the TTL is out of the allowed range.
     RegisterFailed {
+        /// The rendezvous node that rejected the registration.
         rendezvous_node: PeerId,
+        /// The namespace that was requested.
         namespace: Namespace,
+        /// The error code returned by the rendezvous node.
         error: ErrorCode,
     },
-    /// The connection details we learned from this node expired.
+    /// A previously discovered peer's registration has expired.
+    ///
+    /// The TTL of a registration learned through a prior [`Event::Discovered`] event
+    /// has elapsed. The peer may no longer be reachable at the previously known addresses.
     Expired { peer: PeerId },
 }
 

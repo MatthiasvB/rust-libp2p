@@ -76,16 +76,38 @@ fn is_tcp_addr(addr: &Multiaddr) -> bool {
 
     let mut iter = addr.iter();
 
-    let first = match iter.next() {
-        None => return false,
-        Some(p) => p,
+    let Some(first) = iter.next() else {
+        return false;
     };
-    let second = match iter.next() {
-        None => return false,
-        Some(p) => p,
+
+    let Some(second) = iter.next() else {
+        return false;
     };
 
     matches!(first, Ip4(_) | Ip6(_) | Dns(_) | Dns4(_) | Dns6(_)) && matches!(second, Tcp(_))
+}
+
+/// Extract the transport-layer port (TCP or UDP) from a multiaddr.
+fn extract_transport_port(addr: &Multiaddr) -> Option<u16> {
+    use Protocol::*;
+    addr.iter().find_map(|proto| match proto {
+        Tcp(port) | Udp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// Replace the transport-layer port (TCP or UDP) in a multiaddr.
+///
+/// Replaces the protocol at index 1, which is the transport port in standard
+/// IP-based multiaddrs like `/ip4/.../tcp/PORT` or `/ip4/.../udp/PORT/quic-v1`.
+/// Returns `None` if the protocol at index 1 is not TCP or UDP.
+fn replace_transport_port(addr: &Multiaddr, port: u16) -> Option<Multiaddr> {
+    use Protocol::*;
+    addr.replace(1, |proto| match proto {
+        Tcp(_) => Some(Tcp(port)),
+        Udp(_) => Some(Udp(port)),
+        _ => None,
+    })
 }
 
 /// Network behaviour that automatically identifies nodes periodically, returns information
@@ -120,9 +142,9 @@ pub struct Config {
     /// Application-specific version of the protocol family used by the peer,
     /// e.g. `ipfs/1.0.0` or `polkadot/1.0.0`.
     protocol_version: String,
-    /// The key of the local node. Only the public key will be report on the wire.  
+    /// The key of the local node. Only the public key will be report on the wire.
     /// The behaviour will send signed [`PeerRecord`](libp2p_core::PeerRecord) in
-    /// its identify message only when supplied with a keypair.  
+    /// its identify message only when supplied with a keypair.
     local_key: Arc<KeyType>,
     /// Name and version of the local peer implementation, similar to the
     /// `User-Agent` header in the HTTP protocol.
@@ -161,7 +183,7 @@ pub struct Config {
 
 impl Config {
     /// Creates a new configuration for the identify [`Behaviour`] that
-    /// advertises the given protocol version and public key.  
+    /// advertises the given protocol version and public key.
     /// Use [`new_with_signed_peer_record`](Config::new_with_signed_peer_record) for
     /// `signedPeerRecord` support.
     pub fn new(protocol_version: String, local_public_key: PublicKey) -> Self {
@@ -169,7 +191,7 @@ impl Config {
     }
 
     /// Creates a new configuration for the identify [`Behaviour`] that
-    /// advertises the given protocol version and public key.  
+    /// advertises the given protocol version and public key.
     /// The private key will be used to sign [`PeerRecord`](libp2p_core::PeerRecord)
     /// for verifiable address advertisement.
     pub fn new_with_signed_peer_record(protocol_version: String, local_keypair: &Keypair) -> Self {
@@ -343,6 +365,13 @@ impl Behaviour {
             // Apply address translation to the candidate address.
             // For TCP without port-reuse, the observed address contains an ephemeral port which
             // needs to be replaced by the port of a listen address.
+            //
+            // The basic `_address_translation` replaces only the IP and keeps the listen port.
+            // But behind NAT with port remapping, the listen port differs from the external port.
+            // If we know the actual external port from a port-reused or inbound connection,
+            // we use that instead.
+            let known_external_port = self.known_external_port_for(observed);
+
             let translated_addresses = {
                 let mut addrs: Vec<_> = self
                     .listen_addresses
@@ -352,7 +381,16 @@ impl Behaviour {
                             || (is_quic_addr(server, true) && is_quic_addr(observed, true))
                             || (is_quic_addr(server, false) && is_quic_addr(observed, false))
                         {
-                            _address_translation(server, observed)
+                            let addr = _address_translation(server, observed)?;
+
+                            // If we know the actual external port (from a port-reused or
+                            // inbound connection), use it instead of the listen port.
+                            // This handles NAT that remaps ports.
+                            if let Some(port) = known_external_port {
+                                return replace_transport_port(&addr, port);
+                            }
+
+                            Some(addr)
                         } else {
                             None
                         }
@@ -382,6 +420,32 @@ impl Behaviour {
         // incoming connection
         self.events
             .push_back(ToSwarm::NewExternalAddrCandidate(observed.clone()));
+    }
+
+    /// Look up the external port for the given transport type from a non-ephemeral connection.
+    ///
+    /// When a connection uses port reuse (binding to the listen port) or is an inbound connection,
+    /// the observed address contains the actual external port as seen through NAT. This port
+    /// accounts for NAT port remapping and is more accurate than the listen port.
+    fn known_external_port_for(&self, reference_addr: &Multiaddr) -> Option<u16> {
+        for (conn_id, observed_addr) in &self.our_observed_addresses {
+            // Only consider non-ephemeral connections (port-reused outbound or inbound).
+            if self
+                .outbound_connections_with_ephemeral_port
+                .contains(conn_id)
+            {
+                continue;
+            }
+
+            // Check that the transport type matches.
+            if (is_tcp_addr(reference_addr) && is_tcp_addr(observed_addr))
+                || (is_quic_addr(reference_addr, true) && is_quic_addr(observed_addr, true))
+                || (is_quic_addr(reference_addr, false) && is_quic_addr(observed_addr, false))
+            {
+                return extract_transport_port(observed_addr);
+            }
+        }
+        None
     }
 }
 
@@ -532,9 +596,8 @@ impl NetworkBehaviour for Behaviour {
         _addresses: &[Multiaddr],
         _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
-        let peer = match maybe_peer {
-            None => return Ok(vec![]),
-            Some(peer) => peer,
+        let Some(peer) = maybe_peer else {
+            return Ok(vec![]);
         };
 
         Ok(self.discovered_peers.get(&peer))
@@ -616,45 +679,110 @@ impl NetworkBehaviour for Behaviour {
     }
 }
 
-/// Event emitted  by the `Identify` behaviour.
+/// Events emitted by the Identify [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The Identify protocol allows peers to exchange information about themselves, including
+/// their public key, supported protocols, listen addresses, and agent version. This
+/// exchange happens automatically on every new connection.
+///
+/// # Event Lifecycle
+///
+/// 1. **On connection establishment**: The Identify protocol is automatically negotiated.
+///    Once the remote peer sends its identification information, a [`Event::Received`]
+///    event is emitted. Simultaneously, the local node sends its own identification,
+///    producing a [`Event::Sent`] event.
+///
+/// 2. **On change detection**: If the local node's information changes (e.g. new listen
+///    addresses are added), the behaviour may **push** updated information to connected
+///    peers, producing [`Event::Pushed`] events.
+///
+/// 3. **On error**: If the identification exchange fails (e.g. the connection closes mid-
+///    handshake or the protocol is not supported), an [`Event::Error`] event is emitted.
+///
+/// # Difference Between `Sent` and `Pushed`
+///
+/// - [`Event::Sent`]: Emitted when identification information is sent **in response to a
+///   request** from the remote peer (passive, happens once per connection).
+/// - [`Event::Pushed`]: Emitted when the local node **proactively pushes** updated
+///   information to a peer (active, happens when local info changes while connected).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Event {
-    /// Identification information has been received from a peer.
+    /// Identification information has been received from a remote peer.
+    ///
+    /// Emitted after a new connection is established and the remote peer sends its
+    /// Identify response, or when the remote peer pushes updated information.
+    /// The [`Info`] struct contains the peer's public key, protocol version,
+    /// agent version, listen addresses, supported protocols, and observed address.
+    ///
+    /// # Recommended Action
+    ///
+    /// Use the received information to update your knowledge of the remote peer. Common
+    /// uses include adding the peer's listen addresses to the address book, checking
+    /// protocol compatibility, or discovering the peer's observed address of the local
+    /// node (useful for NAT detection via [`Info::observed_addr`]).
     Received {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the information was received.
         connection_id: ConnectionId,
         /// The peer that has been identified.
         peer_id: PeerId,
-        /// The information provided by the peer.
+        /// The identification information provided by the peer, including supported
+        /// protocols, listen addresses, and the address they observe for us.
         info: Info,
     },
-    /// Identification information of the local node has been sent to a peer in
-    /// response to an identification request.
+    /// The local node's identification information has been sent to a remote peer
+    /// in response to an Identify request.
+    ///
+    /// This event is informational. It confirms that the identification exchange
+    /// completed on the local side. No action is typically required.
+    ///
+    /// This event is distinct from [`Event::Pushed`]: `Sent` is a **response** to a
+    /// request from the remote peer, while `Pushed` is a **proactive** update.
     Sent {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the information was sent.
         connection_id: ConnectionId,
         /// The peer that the information has been sent to.
         peer_id: PeerId,
     },
-    /// Identification information of the local node has been actively pushed to
-    /// a peer.
+    /// The local node's identification information has been actively pushed to a peer.
+    ///
+    /// Emitted when the local node detects that its own information has changed (e.g.
+    /// new listen addresses, new supported protocols) and proactively sends the updated
+    /// information to an already-connected peer via the Identify Push protocol.
+    ///
+    /// This event is distinct from [`Event::Sent`]: `Pushed` is a **proactive** update
+    /// triggered by local changes, while `Sent` is a **response** to a remote request.
+    ///
+    /// The `info` field contains the full identification information that was pushed.
+    /// To determine what changed, the application must compare it with previously
+    /// received information.
     Pushed {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the information was pushed.
         connection_id: ConnectionId,
         /// The peer that the information has been sent to.
         peer_id: PeerId,
-        /// The full Info struct we pushed to the remote peer. Clients must
-        /// do some diff'ing to know what has changed since the last push.
+        /// The full identification information that was pushed. Compare with previously
+        /// known information to determine what changed.
         info: Info,
     },
-    /// Error while attempting to identify the remote.
+    /// An error occurred while attempting to identify a remote peer or send identification
+    /// information.
+    ///
+    /// This may occur if the remote peer does not support the Identify protocol, if the
+    /// connection is closed before the exchange completes, or if the protocol negotiation
+    /// fails.
+    ///
+    /// # Recommended Action
+    ///
+    /// This event is typically informational. The connection may still be usable for
+    /// other protocols. Log the error for diagnostics.
     Error {
-        /// Identifier of the connection.
+        /// The identifier of the connection on which the error occurred.
         connection_id: ConnectionId,
         /// The peer with whom the error originated.
         peer_id: PeerId,
-        /// The error that occurred.
+        /// The error that occurred during the identification exchange.
         error: StreamUpgradeError<UpgradeError>,
     },
 }

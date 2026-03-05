@@ -1,3 +1,13 @@
+## 0.2.13
+
+- Turn the `quick-protobuf` dependency optional to only the features which require it.
+  See [PR 6226](https://github.com/libp2p/rust-libp2p/pull/6226)
+
+## 0.2.12
+
+- Avoid depending on the `rand_core` feature in `ed25519-dalek` crate.
+  See [PR 6070](https://github.com/libp2p/rust-libp2p/pull/6070)
+
 ## 0.2.11
 
 - Switch from `libsecp256` to `k256` for secp256k1 support.

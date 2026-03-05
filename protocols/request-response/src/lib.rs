@@ -85,7 +85,7 @@ pub use codec::Codec;
 use futures::channel::oneshot;
 use handler::Handler;
 pub use handler::ProtocolSupport;
-use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
+use libp2p_core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm},
@@ -97,100 +97,183 @@ use smallvec::SmallVec;
 
 use crate::handler::OutboundMessage;
 
-/// An inbound request or response.
+/// An inbound request or response received from a remote peer.
+///
+/// This enum distinguishes between incoming requests (which expect a response) and
+/// incoming responses (which complete an earlier outbound request).
+///
+/// Delivered inside [`Event::Message`].
 #[derive(Debug)]
 pub enum Message<TRequest, TResponse, TChannelResponse = TResponse> {
-    /// A request message.
+    /// An inbound request from a remote peer that expects a response.
+    ///
+    /// The application **must** send a response using [`Behaviour::send_response`]
+    /// with the provided [`ResponseChannel`]. If the channel is dropped without sending
+    /// a response, an [`Event::InboundFailure`] with [`InboundFailure::ResponseOmission`]
+    /// is emitted, and the remote peer will experience an [`OutboundFailure::Io`] or
+    /// [`OutboundFailure::ConnectionClosed`].
     Request {
-        /// The ID of this request.
+        /// A locally unique identifier for this inbound request.
         request_id: InboundRequestId,
-        /// The request message.
+        /// The request payload sent by the remote peer.
         request: TRequest,
-        /// The channel waiting for the response.
+        /// The channel through which the response must be sent.
         ///
-        /// If this channel is dropped instead of being used to send a response
-        /// via [`Behaviour::send_response`], a [`Event::InboundFailure`]
-        /// with [`InboundFailure::ResponseOmission`] is emitted.
+        /// Pass this to [`Behaviour::send_response`] to reply to the request.
+        /// If this channel is dropped instead of being used to send a response,
+        /// an [`Event::InboundFailure`] with [`InboundFailure::ResponseOmission`]
+        /// is emitted.
         channel: ResponseChannel<TChannelResponse>,
     },
-    /// A response message.
+    /// A response to an outbound request previously sent via [`Behaviour::send_request`].
+    ///
+    /// The `request_id` corresponds to the [`OutboundRequestId`] returned by
+    /// [`Behaviour::send_request`], allowing the application to match responses to
+    /// their originating requests.
     Response {
-        /// The ID of the request that produced this response.
-        ///
-        /// See [`Behaviour::send_request`].
+        /// The ID of the outbound request that produced this response, as returned by
+        /// [`Behaviour::send_request`].
         request_id: OutboundRequestId,
-        /// The response message.
+        /// The response payload sent by the remote peer.
         response: TResponse,
     },
 }
 
-/// The events emitted by a request-response [`Behaviour`].
+/// Events emitted by the request-response [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The request-response protocol implements a simple pattern where one peer sends a
+/// request and another peer sends back a response. These events inform the application
+/// about incoming messages, delivery confirmations, and failures.
+///
+/// # Event Lifecycle
+///
+/// ## Outbound Request Flow (initiated by the local node)
+///
+/// 1. The application calls [`Behaviour::send_request`], receiving an [`OutboundRequestId`].
+/// 2. **On success**: An [`Event::Message`] with [`Message::Response`] is emitted, containing
+///    the remote peer's response.
+/// 3. **On failure**: An [`Event::OutboundFailure`] is emitted with details about what went
+///    wrong (dial failure, timeout, connection closed, or unsupported protocol).
+///
+/// ## Inbound Request Flow (initiated by a remote peer)
+///
+/// 1. An [`Event::Message`] with [`Message::Request`] is emitted, containing the request
+///    and a [`ResponseChannel`].
+/// 2. The application processes the request and sends a response via
+///    [`Behaviour::send_response`] using the provided channel.
+/// 3. **On success**: An [`Event::ResponseSent`] is emitted, confirming the response was
+///    flushed to the transport.
+/// 4. **On failure**: An [`Event::InboundFailure`] is emitted if the response could not
+///    be sent (timeout, connection closed, or the response channel was dropped).
 #[derive(Debug)]
 pub enum Event<TRequest, TResponse, TChannelResponse = TResponse> {
-    /// An incoming message (request or response).
+    /// An incoming message (request or response) has been received from a peer.
+    ///
+    /// Match on the inner [`Message`] to determine whether this is an inbound request
+    /// (which requires a response) or a response to a previously sent outbound request.
     Message {
         /// The peer who sent the message.
         peer: PeerId,
-        /// The connection used.
+        /// The connection on which the message was received.
         connection_id: ConnectionId,
-        /// The incoming message.
+        /// The incoming message. See [`Message::Request`] and [`Message::Response`].
         message: Message<TRequest, TResponse, TChannelResponse>,
     },
-    /// An outbound request failed.
+    /// An outbound request (sent via [`Behaviour::send_request`]) has failed.
+    ///
+    /// The `request_id` corresponds to the [`OutboundRequestId`] returned by
+    /// [`Behaviour::send_request`]. After this event, no [`Message::Response`] will
+    /// be received for this request.
+    ///
+    /// # Difference from `InboundFailure`
+    ///
+    /// - `OutboundFailure`: Failure when *sending* a request and *receiving* its response.
+    /// - [`Event::InboundFailure`]: Failure when *receiving* a request and *sending* its
+    ///   response.
     OutboundFailure {
         /// The peer to whom the request was sent.
         peer: PeerId,
-        /// The connection used.
+        /// The connection that was used (or attempted).
         connection_id: ConnectionId,
-        /// The (local) ID of the failed request.
+        /// The ID of the failed outbound request, as returned by
+        /// [`Behaviour::send_request`].
         request_id: OutboundRequestId,
-        /// The error that occurred.
+        /// The reason for the failure.
         error: OutboundFailure,
     },
-    /// An inbound request failed.
+    /// An inbound request from a remote peer has failed.
+    ///
+    /// This indicates that the local node could not process or respond to a request from
+    /// the remote peer. Possible causes include timeouts, connection closures, protocol
+    /// mismatches, or the application dropping the [`ResponseChannel`] without sending
+    /// a response.
+    ///
+    /// # Difference from `OutboundFailure`
+    ///
+    /// - [`Event::OutboundFailure`]: Failure when *sending* a request and *receiving* its
+    ///   response.
+    /// - `InboundFailure`: Failure when *receiving* a request and *sending* its response.
     InboundFailure {
         /// The peer from whom the request was received.
         peer: PeerId,
-        /// The connection used.
+        /// The connection on which the request was received.
         connection_id: ConnectionId,
         /// The ID of the failed inbound request.
         request_id: InboundRequestId,
-        /// The error that occurred.
+        /// The reason for the failure.
         error: InboundFailure,
     },
-    /// A response to an inbound request has been sent.
+    /// A response to an inbound request has been successfully sent.
     ///
-    /// When this event is received, the response has been flushed on
-    /// the underlying transport connection.
+    /// This event confirms that the response has been flushed on the underlying
+    /// transport connection. It is emitted after a successful call to
+    /// [`Behaviour::send_response`].
+    ///
+    /// This is a confirmation event — no action is required, but it may be useful
+    /// for logging, metrics, or cleanup of per-request state.
     ResponseSent {
         /// The peer to whom the response was sent.
         peer: PeerId,
-        /// The connection used.
+        /// The connection on which the response was sent.
         connection_id: ConnectionId,
         /// The ID of the inbound request whose response was sent.
         request_id: InboundRequestId,
     },
 }
 
-/// Possible failures occurring in the context of sending
-/// an outbound request and receiving the response.
+/// Possible failures occurring in the context of sending an outbound request and
+/// receiving the response.
+///
+/// Returned inside [`Event::OutboundFailure`]. Each variant represents a different
+/// failure mode. After receiving an `OutboundFailure`, no response will be delivered
+/// for the corresponding request.
 #[derive(Debug)]
 pub enum OutboundFailure {
-    /// The request could not be sent because a dialing attempt failed.
+    /// The request could not be sent because the dial attempt to the peer failed.
+    ///
+    /// This occurs when there is no existing connection to the peer and a new connection
+    /// could not be established (e.g. the peer is unreachable or all known addresses failed).
     DialFailure,
     /// The request timed out before a response was received.
     ///
-    /// It is not known whether the request may have been
-    /// received (and processed) by the remote peer.
+    /// The timeout is configured via [`Config::with_request_timeout`].
+    /// It is not known whether the request was received (and possibly processed) by the
+    /// remote peer.
     Timeout,
-    /// The connection closed before a response was received.
+    /// The connection was closed before a response was received.
     ///
-    /// It is not known whether the request may have been
-    /// received (and processed) by the remote peer.
+    /// The request may or may not have been received by the remote peer before the
+    /// connection closed.
     ConnectionClosed,
-    /// The remote supports none of the requested protocols.
+    /// The remote peer does not support any of the requested protocols.
+    ///
+    /// This occurs during protocol negotiation when the remote peer's supported
+    /// protocols do not overlap with the protocols configured in this behaviour.
     UnsupportedProtocols,
-    /// An IO failure happened on an outbound stream.
+    /// An I/O error occurred on the outbound stream.
+    ///
+    /// This may occur during sending the request or reading the response.
     Io(io::Error),
 }
 
@@ -212,25 +295,40 @@ impl fmt::Display for OutboundFailure {
 
 impl std::error::Error for OutboundFailure {}
 
-/// Possible failures occurring in the context of receiving an
-/// inbound request and sending a response.
+/// Possible failures occurring in the context of receiving an inbound request and
+/// sending a response.
+///
+/// Returned inside [`Event::InboundFailure`]. Each variant represents a different
+/// failure mode that prevented the local node from successfully handling an inbound
+/// request.
 #[derive(Debug)]
 pub enum InboundFailure {
-    /// The inbound request timed out, either while reading the
-    /// incoming request or before a response is sent, e.g. if
-    /// [`Behaviour::send_response`] is not called in a
-    /// timely manner.
+    /// The inbound request timed out.
+    ///
+    /// This can happen either while reading the incoming request from the stream, or
+    /// because the application did not call [`Behaviour::send_response`] within the
+    /// configured timeout ([`Config::with_request_timeout`]).
     Timeout,
-    /// The connection closed before a response could be send.
+    /// The connection was closed before a response could be sent.
+    ///
+    /// The remote peer may have disconnected or the connection may have been dropped
+    /// for another reason before the application could respond.
     ConnectionClosed,
-    /// The local peer supports none of the protocols requested
-    /// by the remote.
+    /// The local peer does not support any of the protocols requested by the remote.
+    ///
+    /// This occurs during protocol negotiation when the remote peer requests a
+    /// protocol that this node is not configured to handle.
     UnsupportedProtocols,
-    /// The local peer failed to respond to an inbound request
-    /// due to the [`ResponseChannel`] being dropped instead of
-    /// being passed to [`Behaviour::send_response`].
+    /// The application dropped the [`ResponseChannel`] without sending a response.
+    ///
+    /// This occurs when the [`ResponseChannel`] provided in [`Message::Request`] is
+    /// dropped (e.g. goes out of scope) instead of being passed to
+    /// [`Behaviour::send_response`]. The remote peer will typically see a connection
+    /// error or timeout.
     ResponseOmission,
-    /// An IO failure happened on an inbound stream.
+    /// An I/O error occurred on the inbound stream.
+    ///
+    /// This may occur during reading the request or writing the response.
     Io(io::Error),
 }
 
@@ -310,6 +408,10 @@ impl fmt::Display for OutboundRequestId {
 pub struct Config {
     request_timeout: Duration,
     max_concurrent_streams: usize,
+    /// When true (default), outbound requests can be sent over relay connections.
+    /// When false, only direct connections are used for requests, which conserves
+    /// relay bandwidth but may fail if no direct connection exists.
+    allow_relay_for_requests: bool,
 }
 
 impl Default for Config {
@@ -317,6 +419,7 @@ impl Default for Config {
         Self {
             request_timeout: Duration::from_secs(10),
             max_concurrent_streams: 100,
+            allow_relay_for_requests: true,
         }
     }
 }
@@ -338,6 +441,16 @@ impl Config {
     /// Sets the upper bound for the number of concurrent inbound + outbound streams.
     pub fn with_max_concurrent_streams(mut self, num_streams: usize) -> Self {
         self.max_concurrent_streams = num_streams;
+        self
+    }
+
+    /// Configures whether requests can be sent over relay connections.
+    /// 
+    /// By default, relay connections are used for outbound requests (enabled = true).
+    /// Set to `false` to only use direct connections, which conserves relay bandwidth
+    /// but may cause requests to fail if no direct connection to the peer exists.
+    pub fn with_relay_for_requests(mut self, enabled: bool) -> Self {
+        self.allow_relay_for_requests = enabled;
         self
     }
 }
@@ -383,6 +496,22 @@ where
         I: IntoIterator<Item = (TCodec::Protocol, ProtocolSupport)>,
     {
         Self::with_codec(TCodec::default(), protocols, cfg)
+    }
+}
+
+trait IsRelayed {
+    fn is_relayed(&self) -> bool;
+}
+
+impl IsRelayed for Multiaddr {
+    fn is_relayed(&self) -> bool {
+        self.iter().any(|p| p == Protocol::P2pCircuit)
+    }
+}
+
+impl IsRelayed for Option<Multiaddr> {
+    fn is_relayed(&self) -> bool {
+        self.as_ref().is_some_and(|addr| addr.is_relayed())
     }
 }
 
@@ -569,11 +698,27 @@ where
         request: OutboundMessage<TCodec>,
     ) -> Option<OutboundMessage<TCodec>> {
         if let Some(connections) = self.connected.get_mut(peer) {
-            if connections.is_empty() {
+            // Determine eligible connection indices based on relay policy
+            let eligible_indices: Vec<usize> = if self.config.allow_relay_for_requests {
+                // All connections are eligible when relay is allowed
+                (0..connections.len()).collect()
+            } else {
+                // Only direct connections when relay is not allowed
+                connections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.remote_address.is_relayed())
+                    .map(|(idx, _)| idx)
+                    .collect()
+            };
+            
+            if eligible_indices.is_empty() {
                 return Some(request);
             }
-            let ix = (request.request_id.0 as usize) % connections.len();
-            let conn = &mut connections[ix];
+            
+            // Round-robin selection among eligible connections
+            let pick = eligible_indices[request.request_id.0 as usize % eligible_indices.len()];
+            let conn = &mut connections[pick];
             conn.pending_outbound_responses.insert(request.request_id);
             self.pending_events.push_back(ToSwarm::NotifyHandler {
                 peer_id: *peer,
@@ -664,16 +809,22 @@ where
             ..
         }: ConnectionClosed,
     ) {
-        let connections = self
-            .connected
-            .get_mut(&peer_id)
-            .expect("Expected some established connection to peer before closing.");
+        let connections = match self.connected.get_mut(&peer_id) {
+            Some(x) => x,
+            None => {
+                return;
+            }
+        };
 
-        let connection = connections
-            .iter()
-            .position(|c| c.id == connection_id)
-            .map(|p: usize| connections.remove(p))
-            .expect("Expected connection to be established before closing.");
+        let connection = match connections
+                    .iter()
+                    .position(|c| c.id == connection_id)
+                    .map(|p: usize| connections.remove(p)) {
+            Some(conn) => conn,
+            None => {
+                return;
+            },
+        };
 
         debug_assert_eq!(connections.is_empty(), remaining_established == 0);
         if connections.is_empty() {
@@ -707,6 +858,7 @@ where
             peer_id,
             connection_id,
             error,
+            ..
         }: DialFailure,
     ) {
         if let DialError::DialPeerConditionFalse(_) = error {
@@ -743,18 +895,28 @@ where
         connection_id: ConnectionId,
         remote_address: Option<Multiaddr>,
     ) {
-        let mut connection = Connection::new(connection_id, remote_address);
-
-        if let Some(pending_requests) = self.pending_outbound_requests.remove(&peer) {
-            for request in pending_requests {
-                connection
-                    .pending_outbound_responses
-                    .insert(request.request_id);
-                handler.on_behaviour_event(request);
+        // Determine relay status before consuming the address
+        let is_relay_conn = remote_address.is_relayed();
+        let conn_entry = Connection::new(connection_id, remote_address);
+        
+        // Always register the connection for proper state tracking.
+        // Only preload pending requests based on relay policy configuration.
+        let should_preload = self.config.allow_relay_for_requests || !is_relay_conn;
+        
+        if should_preload {
+            if let Some(queued_requests) = self.pending_outbound_requests.remove(&peer) {
+                let conns = self.connected.entry(peer).or_default();
+                conns.push(conn_entry);
+                let conn_ref = conns.last_mut().expect("connection was just added to the vector");
+                for req in queued_requests {
+                    conn_ref.pending_outbound_responses.insert(req.request_id);
+                    handler.on_behaviour_event(req);
+                }
+                return;
             }
         }
-
-        self.connected.entry(peer).or_default().push(connection);
+        
+        self.connected.entry(peer).or_default().push(conn_entry);
     }
 }
 
@@ -792,9 +954,8 @@ where
         _addresses: &[Multiaddr],
         _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
-        let peer = match maybe_peer {
-            None => return Ok(vec![]),
-            Some(peer) => peer,
+        let Some(peer) = maybe_peer else {
+            return Ok(vec![]);
         };
 
         let mut addresses = Vec::new();
@@ -1056,5 +1217,58 @@ impl Connection {
             pending_outbound_responses: Default::default(),
             pending_inbound_responses: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_relayed_direct_address() {
+        let direct_addr: Multiaddr = "/ip4/127.0.0.1/tcp/1234".parse().unwrap();
+        assert!(!direct_addr.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_circuit_address() {
+        let relay_addr: Multiaddr = "/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWGzBRs8WVcMaEXGWwsvFSfJKYphwM6ojrPanuJfup1xFz".parse().unwrap();
+        assert!(relay_addr.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_none_address() {
+        let none_addr: Option<Multiaddr> = None;
+        assert!(!none_addr.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_some_direct_address() {
+        let some_direct: Option<Multiaddr> = Some("/ip4/127.0.0.1/tcp/1234".parse().unwrap());
+        assert!(!some_direct.is_relayed());
+    }
+
+    #[test]
+    fn test_is_relayed_some_circuit_address() {
+        let some_relay: Option<Multiaddr> = Some("/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWGzBRs8WVcMaEXGWwsvFSfJKYphwM6ojrPanuJfup1xFz".parse().unwrap());
+        assert!(some_relay.is_relayed());
+    }
+
+    #[test]
+    fn test_config_default_allows_relay() {
+        let cfg = Config::default();
+        assert!(cfg.allow_relay_for_requests, "Default config should allow relay connections");
+    }
+
+    #[test]
+    fn test_config_disable_relay() {
+        let cfg = Config::default().with_relay_for_requests(false);
+        assert!(!cfg.allow_relay_for_requests);
+    }
+
+    #[test]
+    fn test_config_enable_relay() {
+        let cfg = Config::default().with_relay_for_requests(true);
+        assert!(cfg.allow_relay_for_requests);
     }
 }

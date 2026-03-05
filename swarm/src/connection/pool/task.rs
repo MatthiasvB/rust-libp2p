@@ -99,6 +99,7 @@ pub(crate) async fn new_for_pending_outgoing_connection(
 ) {
     match futures::future::select(abort_receiver, Box::pin(dial)).await {
         Either::Left((Err(oneshot::Canceled), _)) => {
+            println!("Lip2p dial aborted");
             let _ = events
                 .send(PendingConnectionEvent::PendingFailed {
                     id: connection_id,

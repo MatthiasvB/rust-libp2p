@@ -48,6 +48,9 @@ pub use libp2p_core::multihash;
 #[cfg(feature = "dcutr")]
 #[doc(inline)]
 pub use libp2p_dcutr as dcutr;
+#[cfg(feature = "machine-gun-dcutr")]
+#[doc(inline)]
+pub use libp2p_machine_gun_dcutr as machine_gun_dcutr;
 #[cfg(feature = "dns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
 #[cfg(not(target_arch = "wasm32"))]
@@ -81,9 +84,6 @@ pub use libp2p_metrics as metrics;
 #[cfg(feature = "noise")]
 #[doc(inline)]
 pub use libp2p_noise as noise;
-#[cfg(feature = "peer-store")]
-#[doc(inline)]
-pub use libp2p_peer_store as peer_store;
 #[cfg(feature = "ping")]
 #[doc(inline)]
 pub use libp2p_ping as ping;
@@ -147,9 +147,6 @@ pub use libp2p_yamux as yamux;
 pub use multiaddr;
 
 mod builder;
-mod transport_ext;
-
-pub mod bandwidth;
 
 #[cfg(doc)]
 pub mod tutorials;
@@ -172,5 +169,4 @@ pub use self::{
     },
     multiaddr::{multiaddr as build_multiaddr, Multiaddr},
     swarm::Swarm,
-    transport_ext::TransportExt,
 };

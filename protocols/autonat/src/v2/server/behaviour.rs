@@ -140,16 +140,27 @@ where
     }
 }
 
+/// Event emitted by the AutoNAT v2 **server** [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// The AutoNAT v2 server performs dial-back tests on behalf of client peers. When a
+/// client sends a list of addresses to test, the server selects one and attempts to
+/// dial it. This event reports the outcome of each test.
+///
+/// This event is primarily informational/diagnostic and does not typically require
+/// application action.
 #[derive(Debug)]
 pub struct Event {
-    /// All address that were submitted for testing.
+    /// All addresses that were submitted by the client for testing.
     pub all_addrs: Vec<Multiaddr>,
-    /// The address that was eventually tested.
+    /// The specific address that was selected and tested by the server.
     pub tested_addr: Multiaddr,
-    /// The peer id of the client that submitted addresses for testing.
+    /// The peer ID of the client that requested the reachability test.
     pub client: PeerId,
-    /// The amount of data that was requested by the server and was transmitted.
+    /// The amount of data (in bytes) that was requested by the server and transmitted
+    /// as part of the protocol verification handshake.
     pub data_amount: usize,
-    /// The result of the test.
+    /// The result of the dial-back test. `Ok(())` means the server successfully
+    /// connected to `tested_addr`. `Err(error)` means the dial-back failed.
     pub result: Result<(), io::Error>,
 }

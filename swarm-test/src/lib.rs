@@ -38,17 +38,6 @@ use libp2p_swarm::{
 pub trait SwarmExt {
     type NB: NetworkBehaviour;
 
-    /// Create a new [`Swarm`] with an ephemeral identity and the `async-std` runtime.
-    ///
-    /// The swarm will use a [`libp2p_core::transport::MemoryTransport`] together with a
-    /// [`libp2p_plaintext::Config`] authentication layer and [`libp2p_yamux::Config`] as the
-    /// multiplexer. However, these details should not be relied
-    /// upon by the test and may change at any time.
-    #[cfg(feature = "async-std")]
-    fn new_ephemeral(behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
-    where
-        Self: Sized;
-
     /// Create a new [`Swarm`] with an ephemeral identity and the `tokio` runtime.
     ///
     /// The swarm will use a [`libp2p_core::transport::MemoryTransport`] together with a
@@ -57,6 +46,11 @@ pub trait SwarmExt {
     /// upon by the test and may change at any time.
     #[cfg(feature = "tokio")]
     fn new_ephemeral_tokio(behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
+    where
+        Self: Sized;
+
+    #[cfg(feature = "tokio")]
+    fn new_ephemeral_tokio_with_preexisting_keypair(identity: libp2p_identity::Keypair, behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
     where
         Self: Sized;
 
@@ -98,6 +92,8 @@ pub trait SwarmExt {
     ///
     /// If the 10s timeout does not fit your usecase, please fall back to `StreamExt::next`.
     async fn next_swarm_event(&mut self) -> SwarmEvent<<Self::NB as NetworkBehaviour>::ToSwarm>;
+
+    async fn next_swarm_event_with_id(&mut self, id: String) -> SwarmEvent<<Self::NB as NetworkBehaviour>::ToSwarm>;
 
     /// Returns the next behaviour event or times out after 10 seconds.
     ///
@@ -223,8 +219,8 @@ where
 {
     type NB = B;
 
-    #[cfg(feature = "async-std")]
-    fn new_ephemeral(behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
+    #[cfg(feature = "tokio")]
+    fn new_ephemeral_tokio(behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
     where
         Self: Sized,
     {
@@ -235,7 +231,7 @@ where
         let peer_id = PeerId::from(identity.public());
 
         let transport = MemoryTransport::default()
-            .or_transport(libp2p_tcp::async_io::Transport::default())
+            .or_transport(libp2p_tcp::tokio::Transport::default())
             .upgrade(Version::V1)
             .authenticate(libp2p_plaintext::Config::new(&identity))
             .multiplex(libp2p_yamux::Config::default())
@@ -246,19 +242,17 @@ where
             transport,
             behaviour_fn(identity),
             peer_id,
-            libp2p_swarm::Config::with_async_std_executor(),
+            libp2p_swarm::Config::with_tokio_executor(),
         )
     }
 
     #[cfg(feature = "tokio")]
-    fn new_ephemeral_tokio(behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
+    fn new_ephemeral_tokio_with_preexisting_keypair(identity: libp2p_identity::Keypair, behaviour_fn: impl FnOnce(libp2p_identity::Keypair) -> Self::NB) -> Self
     where
         Self: Sized,
     {
         use libp2p_core::{transport::MemoryTransport, upgrade::Version, Transport as _};
-        use libp2p_identity::Keypair;
 
-        let identity = Keypair::generate_ed25519();
         let peer_id = PeerId::from(identity.public());
 
         let transport = MemoryTransport::default()
@@ -295,7 +289,7 @@ where
         let mut listener_done = false;
 
         loop {
-            match futures::future::select(self.next_swarm_event(), other.next_swarm_event()).await {
+            match futures::future::select(self.next_swarm_event_with_id("dialer".into()), other.next_swarm_event_with_id("dialled".into())).await {
                 Either::Left((SwarmEvent::ConnectionEstablished { .. }, _)) => {
                     dialer_done = true;
                 }
@@ -371,6 +365,21 @@ where
             Either::Left(((), _)) => panic!("Swarm did not emit an event within 10s"),
             Either::Right((event, _)) => {
                 tracing::trace!(?event);
+
+                event
+            }
+        }
+    }
+    async fn next_swarm_event_with_id(&mut self, id: String) -> SwarmEvent<<B as NetworkBehaviour>::ToSwarm> {
+        match futures::future::select(
+            futures_timer::Delay::new(Duration::from_secs(10)),
+            self.select_next_some(),
+        )
+        .await
+        {
+            Either::Left(((), _)) => panic!("Swarm did not emit an event within 10s: {id}"),
+            Either::Right((event, _)) => {
+                println!("{id} got event: {event:?}");
 
                 event
             }

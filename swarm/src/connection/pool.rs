@@ -391,7 +391,7 @@ where
         peer: &PeerId,
     ) -> impl Iterator<Item = ConnectionId> + '_ {
         match self.established.get(peer) {
-            Some(conns) => either::Either::Left(conns.iter().map(|(id, _)| *id)),
+            Some(conns) => either::Either::Left(conns.keys().copied()),
             None => either::Either::Right(std::iter::empty()),
         }
     }
@@ -689,6 +689,9 @@ where
                         ),
                     };
 
+                    // The `Result` is consumed immediately below so the large error variant is
+                    // never propagated across stack frames.
+                    #[allow(clippy::result_large_err)]
                     let check_peer_id = || {
                         if let Some(peer) = expected_peer_id {
                             if peer != obtained_peer_id {

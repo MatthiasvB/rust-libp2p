@@ -133,18 +133,62 @@ impl ProbeId {
     }
 }
 
-/// Event produced by [`Behaviour`].
+/// Events emitted by the AutoNAT v1 [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// AutoNAT determines whether the local peer is publicly reachable or behind a NAT/firewall
+/// by asking other peers to dial back to it. These events report on the probing activity
+/// and any changes to the detected NAT status.
+///
+/// # Event Lifecycle
+///
+/// The behaviour periodically initiates **outbound probes** where it asks a remote peer
+/// to dial back to the local node's addresses. Simultaneously, it may receive **inbound
+/// probes** from other peers requesting the same service.
+///
+/// - [`Event::OutboundProbe`]: Reports on probes initiated by the *local* node
+///   (asking a remote peer to dial back).
+/// - [`Event::InboundProbe`]: Reports on probes initiated by a *remote* peer
+///   (a remote peer asking this node to dial back to it).
+/// - [`Event::StatusChanged`]: Emitted when the overall NAT status assessment changes
+///   (e.g. from unknown to public, or from public to private).
+///
+/// # Recommended Action
+///
+/// - **`StatusChanged`**: This is the most important event. Update your application's
+///   understanding of its reachability. When the status changes to [`NatStatus::Public`],
+///   the confirmed external address can be shared with other peers.
+/// - **`OutboundProbe` / `InboundProbe`**: These are primarily informational/diagnostic.
+///   They can be useful for logging and monitoring NAT probing activity.
 #[derive(Debug)]
 pub enum Event {
-    /// Event on an inbound probe.
+    /// Progress or result of an inbound probe (a remote peer asked this node to dial back).
+    ///
+    /// See [`InboundProbeEvent`] for the detailed sub-events (request received, response
+    /// sent, or error).
     InboundProbe(InboundProbeEvent),
-    /// Event on an outbound probe.
+    /// Progress or result of an outbound probe (this node asked a remote peer to dial back).
+    ///
+    /// See [`OutboundProbeEvent`] for the detailed sub-events (request sent, response
+    /// received, or error).
     OutboundProbe(OutboundProbeEvent),
-    /// The assumed NAT changed.
+    /// The assessed NAT status has changed.
+    ///
+    /// Emitted when the behaviour's confidence in the current NAT status changes enough
+    /// to flip the assessment. For example, if multiple probes consistently show the node
+    /// is publicly reachable, the status changes from [`NatStatus::Unknown`] to
+    /// [`NatStatus::Public`]. Conversely, if probes start failing, the status may change
+    /// to [`NatStatus::Private`].
+    ///
+    /// # Recommended Action
+    ///
+    /// Update the application's reachability state. If transitioning to `Public`, you may
+    /// want to advertise your external address. If transitioning to `Private`, consider
+    /// using a relay for connectivity.
     StatusChanged {
-        /// Former status.
+        /// The previous NAT status.
         old: NatStatus,
-        /// New status.
+        /// The new NAT status.
         new: NatStatus,
     },
 }
@@ -291,7 +335,7 @@ impl Behaviour {
         self.as_client().on_new_address();
     }
 
-    fn as_client(&mut self) -> AsClient {
+    fn as_client(&mut self) -> AsClient<'_> {
         AsClient {
             inner: &mut self.inner,
             local_peer_id: self.local_peer_id,
@@ -310,7 +354,7 @@ impl Behaviour {
         }
     }
 
-    fn as_server(&mut self) -> AsServer {
+    fn as_server(&mut self) -> AsServer<'_> {
         AsServer {
             inner: &mut self.inner,
             config: &self.config,
