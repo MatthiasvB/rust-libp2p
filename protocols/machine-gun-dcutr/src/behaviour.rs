@@ -317,8 +317,13 @@ impl Behaviour {
         locally_initiated: bool,
         override_role: bool,
     ) {
-        let (quic_addrs, tcp_addrs): (Vec<_>, Vec<_>) =
-            addresses.into_iter().partition(is_quic);
+        tracing::debug!(
+            target = %peer_id,
+            ?addresses,
+            "Initiating hole punching"
+        );
+
+        let (quic_addrs, tcp_addrs): (Vec<_>, Vec<_>) = addresses.into_iter().partition(is_quic);
 
         // TCP addresses: single dial (no burst).
         if !tcp_addrs.is_empty() {
@@ -601,8 +606,8 @@ impl NetworkBehaviour for Behaviour {
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
-                    false,  // not locally initiated
-                    false,  // no role override
+                    false, // not locally initiated
+                    false, // no role override
                 );
             }
             Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
@@ -637,8 +642,8 @@ impl NetworkBehaviour for Behaviour {
                     event_source,
                     remote_addrs,
                     relayed_connection_id,
-                    true,   // locally initiated
-                    true,   // override role
+                    true, // locally initiated
+                    true, // override role
                 );
             }
             // TODO: remove when Rust 1.82 is MSRV
@@ -648,7 +653,10 @@ impl NetworkBehaviour for Behaviour {
     }
 
     #[tracing::instrument(level = "trace", name = "NetworkBehaviour::poll", skip(self, cx))]
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if let Some(event) = self.queued_events.pop_front() {
             return Poll::Ready(event);
         }
@@ -663,7 +671,10 @@ impl NetworkBehaviour for Behaviour {
             }
 
             // If the hole-punch already succeeded for this peer, cancel remaining bursts.
-            if !self.holepunch_in_progress.contains(&self.pending_bursts[i].peer_id) {
+            if !self
+                .holepunch_in_progress
+                .contains(&self.pending_bursts[i].peer_id)
+            {
                 tracing::debug!(
                     peer = %self.pending_bursts[i].peer_id,
                     remaining = self.pending_bursts[i].remaining,
@@ -701,7 +712,8 @@ impl NetworkBehaviour for Behaviour {
 
                     // Reset timer for next burst.
                     if remaining > 0 {
-                        self.pending_bursts[i].delay = Box::pin(Delay::new(self.config.hole_punch_burst_interval));
+                        self.pending_bursts[i].delay =
+                            Box::pin(Delay::new(self.config.hole_punch_burst_interval));
                     }
 
                     return Poll::Ready(ToSwarm::Dial { opts });
