@@ -37,38 +37,13 @@
         (crane.mkLib pkgs).overrideToolchain
         (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
 
-      filerequest_be = craneLib.buildPackage {
-        src = craneLib.cleanCargoSource (craneLib.path ./.);
-        strictDeps = true;
-
-        buildInputs = with pkgs;
-          [
-            # Add additional build inputs here
-            grpc-tools
-            sqlite
-          ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            # Additional darwin specific inputs can be set here
-            pkgs.libiconv
-          ];
-
-        # Additional environment variables can be set directly
-        # MY_CUSTOM_VAR = "some value";
-      };
 
       treefmtEval = treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
     in {
       formatter = treefmtEval.config.build.wrapper;
 
       checks = {
-        inherit filerequest_be;
         formatting = treefmtEval.config.build.check self;
-      };
-
-      packages.default = filerequest_be;
-
-      apps.default = flake-utils.lib.mkApp {
-        drv = filerequest_be;
       };
 
       devShells.default = craneLib.devShell {
