@@ -54,29 +54,60 @@ pub enum OutboundProbeError {
     Response(ResponseError),
 }
 
+/// Events related to outbound AutoNAT probes, where this node has asked a remote peer
+/// to dial back to test the *local* node's reachability.
+///
+/// These events are emitted as part of [`Event::OutboundProbe`](super::Event::OutboundProbe)
+/// and report on the lifecycle of the probe process.
+///
+/// # Event Lifecycle
+///
+/// 1. [`OutboundProbeEvent::Request`]: A dial-back request was sent to a remote peer
+///    (the "server" for this probe).
+/// 2. [`OutboundProbeEvent::Response`]: The remote peer successfully dialed back to this
+///    node, confirming reachability at a specific address.
+/// 3. [`OutboundProbeEvent::Error`]: The probe failed (e.g. the remote could not dial
+///    any of the local addresses, the request was rejected, or no suitable server was
+///    available).
+///
+/// Probe results feed into the overall NAT status assessment. When enough probes
+/// consistently report the same result, the behaviour emits an
+/// [`Event::StatusChanged`](super::Event::StatusChanged).
 #[derive(Debug)]
 pub enum OutboundProbeEvent {
     /// A dial-back request was sent to a remote peer.
+    ///
+    /// The remote peer will attempt to dial back to this node's listen addresses.
+    /// The result will be reported in a subsequent [`OutboundProbeEvent::Response`]
+    /// or [`OutboundProbeEvent::Error`] event.
     Request {
         probe_id: ProbeId,
-        /// Peer to which the request is sent.
+        /// The peer to which the dial-back request was sent.
         peer: PeerId,
     },
-    /// The remote successfully dialed one of our addresses.
+    /// The remote peer successfully dialed back to this node.
+    ///
+    /// The remote confirmed that the local node is reachable at the specified address.
+    /// This result contributes positively to the NAT status confidence.
     Response {
         probe_id: ProbeId,
-        /// Id of the peer that sent the response.
+        /// The peer that performed the dial-back.
         peer: PeerId,
-        /// The address at which the remote succeeded to dial us.
+        /// The address at which the remote successfully connected to this node.
         address: Multiaddr,
     },
-    /// The outbound request failed, was rejected, or the remote could dial
-    /// none of our addresses.
+    /// The outbound probe failed.
+    ///
+    /// The remote peer could not dial back to this node, the request was rejected,
+    /// or no suitable server was available to perform the probe. This result
+    /// contributes negatively to the NAT status confidence.
     Error {
         probe_id: ProbeId,
-        /// Id of the peer used for the probe.
-        /// `None` if the probe was aborted due to no addresses or no qualified server.
+        /// The peer used for the probe. `None` if the probe was aborted before a
+        /// request could be sent (e.g. no listen addresses configured or no qualified
+        /// server available).
         peer: Option<PeerId>,
+        /// The specific error that caused the probe to fail.
         error: OutboundProbeError,
     },
 }

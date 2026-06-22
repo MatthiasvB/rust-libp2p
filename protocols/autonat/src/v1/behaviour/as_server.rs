@@ -47,29 +47,58 @@ pub enum InboundProbeError {
     Response(ResponseError),
 }
 
+/// Events related to inbound AutoNAT probes, where a remote peer has asked this node
+/// to dial back to it to test the remote peer's reachability.
+///
+/// These events are emitted as part of [`Event::InboundProbe`](super::Event::InboundProbe)
+/// and report on the lifecycle of the dial-back process.
+///
+/// # Event Lifecycle
+///
+/// 1. [`InboundProbeEvent::Request`]: A remote peer has sent a dial-back request.
+/// 2. [`InboundProbeEvent::Response`]: This node successfully dialed the remote peer at
+///    one of the provided addresses and has sent a success response.
+/// 3. [`InboundProbeEvent::Error`]: The dial-back failed (e.g. all addresses were
+///    unreachable, the request was invalid, or it was rejected due to rate limiting).
+///
+/// These events are primarily informational/diagnostic and do not typically require
+/// application action.
 #[derive(Debug)]
 pub enum InboundProbeEvent {
     /// A dial-back request was received from a remote peer.
+    ///
+    /// This node will attempt to dial the provided addresses to test the remote
+    /// peer's reachability. The result will be reported in a subsequent
+    /// [`InboundProbeEvent::Response`] or [`InboundProbeEvent::Error`] event.
     Request {
         probe_id: ProbeId,
-        /// Peer that sent the request.
+        /// The peer that sent the dial-back request.
         peer: PeerId,
-        /// The addresses that will be attempted to dial.
+        /// The addresses that this node will attempt to dial.
         addresses: Vec<Multiaddr>,
     },
-    /// A dial request to the remote was successful.
+    /// The dial-back to the remote peer was successful.
+    ///
+    /// This node successfully connected to the remote peer at the specified address,
+    /// confirming that the address is publicly reachable. A success response has been
+    /// sent to the requesting peer.
     Response {
         probe_id: ProbeId,
-        /// Peer to which the response is sent.
+        /// The peer to which the success response was sent.
         peer: PeerId,
+        /// The address that was successfully dialed.
         address: Multiaddr,
     },
-    /// The inbound request failed, was rejected, or none of the remote's
-    /// addresses could be dialed.
+    /// The inbound probe failed.
+    ///
+    /// This may occur because none of the remote peer's addresses could be dialed,
+    /// the request was rejected due to rate limiting, or another error occurred.
+    /// An error response has been sent to the requesting peer (if applicable).
     Error {
         probe_id: ProbeId,
-        /// Peer that sent the dial-back request.
+        /// The peer that sent the dial-back request.
         peer: PeerId,
+        /// The specific error that caused the probe to fail.
         error: InboundProbeError,
     },
 }

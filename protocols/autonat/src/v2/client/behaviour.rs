@@ -390,18 +390,41 @@ impl Debug for Error {
     }
 }
 
+/// Event emitted by the AutoNAT v2 **client** [`Behaviour`] to the application via
+/// [`SwarmEvent::Behaviour`](libp2p_swarm::SwarmEvent::Behaviour).
+///
+/// AutoNAT v2 improves upon v1 by testing individual addresses rather than the peer as
+/// a whole. The client periodically selects candidate external addresses and asks a
+/// connected server to dial back to that specific address to verify reachability.
+///
+/// # Event Lifecycle
+///
+/// 1. The behaviour discovers candidate external addresses (from
+///    [`SwarmEvent::NewExternalAddrCandidate`](libp2p_swarm::SwarmEvent::NewExternalAddrCandidate)).
+/// 2. At the configured probe interval, it selects a candidate and a connected server
+///    that supports AutoNAT v2.
+/// 3. The server attempts to connect to the candidate address.
+/// 4. This event is emitted with the result: `Ok(())` if the address is reachable, or
+///    `Err(error)` if not.
+///
+/// # Recommended Action
+///
+/// - On `Ok(())`: The `tested_addr` is confirmed as a reachable external address.
+///   The behaviour automatically confirms it via the swarm.
+/// - On `Err(_)`: The address could not be reached. It will not be confirmed as external.
 #[derive(Debug)]
 pub struct Event {
     /// The address that was selected for testing.
     pub tested_addr: Multiaddr,
-    /// The amount of data that was sent to the server.
-    /// Is 0 if it wasn't necessary to send any data.
-    /// Otherwise it's a number between 30.000 and 100.000.
+    /// The amount of data that was sent to the server as part of the protocol.
+    /// Is `0` if it wasn't necessary to send any data.
+    /// Otherwise it's a number between 30,000 and 100,000 bytes.
     pub bytes_sent: usize,
-    /// The peer id of the server that was selected for testing.
+    /// The peer ID of the server that performed the dial-back test.
     pub server: PeerId,
-    /// The result of the test. If the test was successful, this is `Ok(())`.
-    /// Otherwise it's an error.
+    /// The result of the reachability test. `Ok(())` means the server successfully
+    /// dialed back to `tested_addr`, confirming it is publicly reachable. `Err(error)`
+    /// means the test failed.
     pub result: Result<(), Error>,
 }
 
