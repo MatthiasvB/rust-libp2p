@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { result, ..})) => {
                 match result {
                     kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { key, providers, .. })) => {
-                        for peer in providers {
+                        for peer in providers.keys() {
                             println!(
                                 "Peer {peer:?} provides key {:?}",
                                 std::str::from_utf8(key.as_ref()).unwrap()

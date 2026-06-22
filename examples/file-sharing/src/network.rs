@@ -238,7 +238,9 @@ impl EventLoop {
                 },
             )) => {
                 if let Some(sender) = self.pending_get_providers.remove(&id) {
-                    sender.send(providers).expect("Receiver not to be dropped");
+                    sender
+                        .send(providers.into_keys().collect())
+                        .expect("Receiver not to be dropped");
 
                     // Finish the query. We are only interested in the first result.
                     self.swarm
