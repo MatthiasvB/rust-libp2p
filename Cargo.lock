@@ -2875,6 +2875,7 @@ dependencies = [
  "libp2p-identify",
  "libp2p-identity",
  "libp2p-kad",
+ "libp2p-machine-gun-dcutr",
  "libp2p-mdns",
  "libp2p-memory-connection-limits",
  "libp2p-metrics",
@@ -3161,6 +3162,33 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uint",
+ "web-time",
+]
+
+[[package]]
+name = "libp2p-machine-gun-dcutr"
+version = "0.14.0"
+dependencies = [
+ "asynchronous-codec",
+ "either",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identify",
+ "libp2p-identity",
+ "libp2p-plaintext",
+ "libp2p-relay",
+ "libp2p-swarm",
+ "libp2p-swarm-test",
+ "libp2p-tcp",
+ "libp2p-yamux",
+ "prost 0.14.4",
+ "prost-codec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "web-time",
 ]
 
@@ -3891,6 +3919,19 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "machine-gun-dcutr-example"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "futures-timer",
+ "libp2p",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "match-lookup"
