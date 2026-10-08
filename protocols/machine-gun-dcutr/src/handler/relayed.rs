@@ -108,19 +108,15 @@ impl Handler {
     ) {
         match output {
             future::Either::Left(stream) => {
-                if self
-                    .inbound_stream
-                    .try_push(inbound::handshake(
-                        stream,
-                        self.holepunch_candidates.clone(),
-                    ))
-                    .is_err()
-                {
-                    tracing::warn!(
-                        "New inbound connect stream while still upgrading previous one. Replacing previous with new.",
-                    );
+                match self.inbound_stream.try_push(inbound::handshake(
+                    stream,
+                    self.holepunch_candidates.clone(),
+                )) {
+                    Ok(()) => self.attempts = self.attempts.saturating_add(1),
+                    Err(_) => tracing::warn!(
+                        "Remote opened a new connect stream while the previous one is still being upgraded. Dropping the new stream.",
+                    ),
                 }
-                self.attempts += 1;
             }
             // A connection listener denies all incoming substreams, thus none can ever be fully
             // negotiated. TODO: remove when Rust 1.82 is MSRV
@@ -148,7 +144,7 @@ impl Handler {
             .is_err()
         {
             tracing::warn!(
-                "New outbound connect stream while still upgrading previous one. Replacing previous with new.",
+                "New outbound connect stream while the previous one is still being upgraded. Dropping the new stream.",
             );
         }
     }
@@ -219,7 +215,7 @@ impl ConnectionHandler for Handler {
                     .push_back(ConnectionHandlerEvent::OutboundSubstreamRequest {
                         protocol: SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL_NAME), ()),
                     });
-                self.attempts += 1;
+                self.attempts = self.attempts.saturating_add(1);
             }
         }
     }

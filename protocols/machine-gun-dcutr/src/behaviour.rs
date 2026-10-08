@@ -24,6 +24,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     future::Future,
+    num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -135,6 +136,8 @@ impl Config {
 pub struct Event {
     /// The peer with whom the direct connection upgrade was attempted.
     pub remote_peer_id: PeerId,
+    /// The relayed connection that the hole-punch tried to upgrade.
+    pub relayed_connection_id: ConnectionId,
     /// The result of the hole-punching attempt. `Ok(connection_id)` contains the ID
     /// of the newly established direct connection. `Err(error)` indicates the attempt
     /// failed.
@@ -180,49 +183,57 @@ pub struct Behaviour {
     /// The local peer ID, used to append `/p2p/<peer_id>` to candidate addresses.
     me: PeerId,
 
-    /// Maps direct (hole-punch) connection IDs to their relayed connection ID and
-    /// a flag indicating whether the local node initiated the DCUtR upgrade.
-    ///
-    /// `locally_initiated = true` means this node is the listener on the relay
-    /// (OutboundConnect path) — local retries via `Command::Connect`.
-    /// `locally_initiated = false` means this node is the dialer on the relay
-    /// (InboundConnect path) — remote controls retries.
-    direct_to_relayed_connections: HashMap<ConnectionId, (ConnectionId, bool)>,
-
-    /// Indexed by the [`ConnectionId`] of the relayed connection and
-    /// the [`PeerId`] we are trying to establish a direct connection to.
-    outgoing_direct_connection_attempts: HashMap<(ConnectionId, PeerId), u8>,
-
-    /// Peers for which a hole-punch dial is currently in progress.
-    ///
-    /// When the hole-punch succeeds, the direct connection may arrive as
-    /// **inbound** on this node (if the remote's dial won the race). In that
-    /// case, `handle_established_outbound_connection` never fires for our dial,
-    /// so we use this set to detect hole-punch success in
-    /// `handle_established_inbound_connection` as well.
-    holepunch_in_progress: HashSet<PeerId>,
-
-    /// Pending rapid-fire QUIC dial bursts.
-    ///
-    /// Each entry contains a timer, remaining burst count, the target peer,
-    /// the addresses to dial, the relayed connection ID, and whether this is
-    /// a locally-initiated (OutboundConnect) or remote-initiated (InboundConnect)
-    /// hole-punch.
-    pending_bursts: Vec<PendingBurst>,
+    /// Hole-punch attempts in progress, keyed by the relayed connection they upgrade.
+    attempts: HashMap<ConnectionId, Attempt>,
 
     /// Configuration parameters.
     config: Config,
 }
 
-/// A pending rapid-fire burst of hole-punch dials.
+/// Hole-punching on one relayed connection. Each CONNECT round is one attempt, which has
+/// failed only once its burst has fired every dial and all of them have failed.
+struct Attempt {
+    peer: PeerId,
+    /// Number of CONNECT rounds negotiated on the relayed connection so far.
+    number: u8,
+    /// Whether we are the listener on the relayed connection and thus drive the retries.
+    locally_initiated: bool,
+    /// Direct dials that have neither failed nor succeeded yet.
+    outstanding: HashSet<ConnectionId>,
+    burst: Option<PendingBurst>,
+}
+
+/// The QUIC dials of an attempt that have not been fired yet.
 struct PendingBurst {
     delay: Pin<Box<Delay>>,
-    remaining: usize,
-    peer_id: PeerId,
+    remaining: NonZeroUsize,
     addresses: Vec<Multiaddr>,
-    relayed_connection_id: ConnectionId,
-    locally_initiated: bool,
-    override_role: bool,
+}
+
+impl Attempt {
+    fn new(peer: PeerId, locally_initiated: bool) -> Self {
+        Self {
+            peer,
+            number: 0,
+            locally_initiated,
+            outstanding: HashSet::new(),
+            burst: None,
+        }
+    }
+
+    fn dial(&mut self, addresses: Vec<Multiaddr>) -> DialOpts {
+        let mut builder = DialOpts::peer_id(self.peer)
+            .condition(dial_opts::PeerCondition::Always)
+            .addresses(addresses);
+
+        if self.locally_initiated {
+            builder = builder.override_role();
+        }
+
+        let opts = builder.build();
+        self.outstanding.insert(opts.connection_id());
+        opts
+    }
 }
 
 impl Behaviour {
@@ -238,10 +249,7 @@ impl Behaviour {
             direct_connections: Default::default(),
             address_candidates: Vec::new(),
             me: local_peer_id,
-            direct_to_relayed_connections: Default::default(),
-            outgoing_direct_connection_attempts: Default::default(),
-            holepunch_in_progress: Default::default(),
-            pending_bursts: Vec::new(),
+            attempts: Default::default(),
             config,
         }
     }
@@ -290,6 +298,15 @@ impl Behaviour {
         }
     }
 
+    /// The hole-punch address candidates advertised to remote peers, each ending in
+    /// `/p2p/<local_peer_id>`.
+    ///
+    /// A relayed connection captures the candidates when it is established, so changes
+    /// only apply to relayed connections established afterwards.
+    pub fn address_candidates(&self) -> &[Multiaddr] {
+        &self.address_candidates
+    }
+
     fn observed_addresses(&self) -> Vec<Multiaddr> {
         let addrs = self.address_candidates.clone();
         tracing::debug!(
@@ -300,157 +317,105 @@ impl Behaviour {
         addrs
     }
 
-    /// Initiate hole-punch dials, with rapid-fire bursts for QUIC addresses.
+    /// Start the next round of the attempt on `relayed_connection_id`.
     ///
-    /// Splits the address list into QUIC and non-QUIC (TCP) addresses:
-    /// - **QUIC addresses**: emits a burst of dials (configurable count and interval).
-    ///   All dials share the same UDP socket via quinn's endpoint multiplexing,
-    ///   creating a true "machine gun" of Initial packets from the same source port.
-    /// - **TCP addresses**: emits a single dial. Concurrent TCP dials to the same
-    ///   remote from the same source port hit the 4-tuple constraint and fall back
-    ///   to ephemeral ports, defeating hole-punching.
-    fn initiate_hole_punch_dials(
+    /// TCP addresses get a single dial, because concurrent TCP dials to the same remote from
+    /// the same source port hit the 4-tuple constraint and fall back to ephemeral ports. QUIC
+    /// addresses get a burst of dials that all share the same UDP socket.
+    fn start_round(
         &mut self,
-        peer_id: PeerId,
-        addresses: Vec<Multiaddr>,
+        peer: PeerId,
         relayed_connection_id: ConnectionId,
         locally_initiated: bool,
-        override_role: bool,
+        addresses: Vec<Multiaddr>,
     ) {
         tracing::debug!(
-            target = %peer_id,
+            target = %peer,
+            relayed_connection = %relayed_connection_id,
             ?addresses,
             "Initiating hole punching"
         );
 
+        let attempt = self
+            .attempts
+            .entry(relayed_connection_id)
+            .or_insert_with(|| Attempt::new(peer, locally_initiated));
+        attempt.number = attempt.number.saturating_add(1);
+
         let (quic_addrs, tcp_addrs): (Vec<_>, Vec<_>) = addresses.into_iter().partition(is_quic);
 
-        // TCP addresses: single dial (no burst).
         if !tcp_addrs.is_empty() {
-            tracing::debug!(
-                target = %peer_id,
-                count = tcp_addrs.len(),
-                "Hole-punch dial for TCP addresses (single shot)"
-            );
-            let opts = self.create_hole_punch_dial(
-                peer_id,
-                tcp_addrs,
-                relayed_connection_id,
-                locally_initiated,
-                override_role,
-            );
+            let opts = attempt.dial(tcp_addrs);
             self.queued_events.push_back(ToSwarm::Dial { opts });
         }
 
-        // QUIC addresses: rapid-fire burst.
+        attempt.burst = None;
         if !quic_addrs.is_empty() {
-            let burst_count = self.config.hole_punch_burst_count;
-            let burst_interval = self.config.hole_punch_burst_interval;
-
             tracing::debug!(
-                target = %peer_id,
+                target = %peer,
                 count = quic_addrs.len(),
-                burst_count,
-                interval_ms = burst_interval.as_millis(),
+                burst_count = self.config.hole_punch_burst_count,
+                interval_ms = self.config.hole_punch_burst_interval.as_millis(),
                 "Hole-punch burst for QUIC addresses"
             );
 
-            // Emit the first QUIC dial immediately.
-            let opts = self.create_hole_punch_dial(
-                peer_id,
-                quic_addrs.clone(),
-                relayed_connection_id,
-                locally_initiated,
-                override_role,
-            );
+            let opts = attempt.dial(quic_addrs.clone());
             self.queued_events.push_back(ToSwarm::Dial { opts });
 
-            // Schedule remaining burst dials with delays.
-            if burst_count > 1 {
-                self.pending_bursts.push(PendingBurst {
-                    delay: Box::pin(Delay::new(burst_interval)),
-                    remaining: burst_count - 1,
-                    peer_id,
-                    addresses: quic_addrs,
-                    relayed_connection_id,
-                    locally_initiated,
-                    override_role,
+            attempt.burst =
+                NonZeroUsize::new(self.config.hole_punch_burst_count - 1).map(|remaining| {
+                    PendingBurst {
+                        delay: Box::pin(Delay::new(self.config.hole_punch_burst_interval)),
+                        remaining,
+                        addresses: quic_addrs,
+                    }
                 });
-            }
         }
     }
 
-    /// Create a single hole-punch dial and register it in tracking state.
-    fn create_hole_punch_dial(
-        &mut self,
-        peer_id: PeerId,
-        addresses: Vec<Multiaddr>,
-        relayed_connection_id: ConnectionId,
-        locally_initiated: bool,
-        override_role: bool,
-    ) -> DialOpts {
-        let mut builder = DialOpts::peer_id(peer_id)
-            .condition(dial_opts::PeerCondition::Always)
-            .addresses(addresses);
-
-        if override_role {
-            builder = builder.override_role();
-        }
-
-        let opts = builder.build();
-        let connection_id = opts.connection_id();
-
-        self.direct_to_relayed_connections
-            .insert(connection_id, (relayed_connection_id, locally_initiated));
-
-        opts
+    /// The relayed connection whose attempt made the direct dial `connection_id`.
+    fn attempt_dialing(&self, connection_id: ConnectionId) -> Option<ConnectionId> {
+        self.attempts
+            .iter()
+            .find(|(_, attempt)| attempt.outstanding.contains(&connection_id))
+            .map(|(relayed_connection_id, _)| *relayed_connection_id)
     }
 
-    fn on_dial_failure(
-        &mut self,
-        DialFailure {
-            peer_id,
-            connection_id: failed_direct_connection,
-            ..
-        }: DialFailure,
-    ) {
-        let Some(peer_id) = peer_id else {
+    fn on_dial_failure(&mut self, DialFailure { connection_id, .. }: DialFailure) {
+        let Some(relayed_connection_id) = self.attempt_dialing(connection_id) else {
             return;
         };
+        let attempt = self
+            .attempts
+            .get_mut(&relayed_connection_id)
+            .expect("attempt to exist for its own dial");
+        attempt.outstanding.remove(&connection_id);
 
-        let Some(&(relayed_connection_id, locally_initiated)) = self
-            .direct_to_relayed_connections
-            .get(&failed_direct_connection)
-        else {
+        if !attempt.outstanding.is_empty() || attempt.burst.is_some() {
             return;
-        };
+        }
 
-        let Some(attempt) = self
-            .outgoing_direct_connection_attempts
-            .get(&(relayed_connection_id, peer_id))
-        else {
-            return;
-        };
-
-        if *attempt < MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
-            if locally_initiated {
-                // OutboundConnect path: we control retries.
+        let peer_id = attempt.peer;
+        if attempt.number < MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
+            // The remote drives the retries if we are the dialer on the relayed connection.
+            if attempt.locally_initiated {
                 self.queued_events.push_back(ToSwarm::NotifyHandler {
                     handler: NotifyHandler::One(relayed_connection_id),
                     peer_id,
                     event: Either::Left(handler::relayed::Command::Connect),
-                })
+                });
             }
-            // InboundConnect path: remote controls retries, nothing to do here.
-        } else {
-            self.holepunch_in_progress.remove(&peer_id);
-            self.queued_events.extend([ToSwarm::GenerateEvent(Event {
-                remote_peer_id: peer_id,
-                result: Err(Error {
-                    inner: InnerError::AttemptsExceeded(MAX_NUMBER_OF_UPGRADE_ATTEMPTS),
-                }),
-            })]);
+            return;
         }
+
+        self.attempts.remove(&relayed_connection_id);
+        self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
+            remote_peer_id: peer_id,
+            relayed_connection_id,
+            result: Err(Error {
+                inner: InnerError::AttemptsExceeded(MAX_NUMBER_OF_UPGRADE_ATTEMPTS),
+            }),
+        }));
     }
 
     fn on_connection_closed(
@@ -462,18 +427,21 @@ impl Behaviour {
             ..
         }: ConnectionClosed,
     ) {
-        if !connected_point.is_relayed() {
-            let connections = self
-                .direct_connections
-                .get_mut(&peer_id)
-                .expect("Peer of direct connection to be tracked.");
-            connections
-                .remove(&connection_id)
-                .then_some(())
-                .expect("Direct connection to be tracked.");
-            if connections.is_empty() {
-                self.direct_connections.remove(&peer_id);
-            }
+        if connected_point.is_relayed() {
+            self.attempts.remove(&connection_id);
+            return;
+        }
+
+        let connections = self
+            .direct_connections
+            .get_mut(&peer_id)
+            .expect("Peer of direct connection to be tracked.");
+        connections
+            .remove(&connection_id)
+            .then_some(())
+            .expect("Direct connection to be tracked.");
+        if connections.is_empty() {
+            self.direct_connections.remove(&peer_id);
         }
     }
 }
@@ -506,23 +474,17 @@ impl NetworkBehaviour for Behaviour {
             .or_default()
             .insert(connection_id);
 
-        assert!(
-            !self
-                .direct_to_relayed_connections
-                .contains_key(&connection_id),
-            "state mismatch"
-        );
-
-        // If a hole-punch is in progress with this peer and we received a direct
-        // inbound connection, the remote's dial won the race. Emit a success event
-        // so the application knows the hole-punch succeeded regardless of which
-        // side's dial created the connection.
-        if self.holepunch_in_progress.remove(&peer) {
-            self.queued_events.extend([ToSwarm::GenerateEvent(Event {
-                remote_peer_id: peer,
-                result: Ok(connection_id),
-            })]);
-        }
+        // The remote's dial won the race. We cannot tell which relayed connection's round it
+        // belongs to, so it completes every attempt with this peer.
+        let completed = self.attempts.extract_if(|_, attempt| attempt.peer == peer);
+        self.queued_events
+            .extend(completed.map(|(relayed_connection_id, _)| {
+                ToSwarm::GenerateEvent(Event {
+                    remote_peer_id: peer,
+                    relayed_connection_id,
+                    result: Ok(connection_id),
+                })
+            }));
 
         Ok(Either::Right(dummy::ConnectionHandler))
     }
@@ -552,25 +514,13 @@ impl NetworkBehaviour for Behaviour {
             .or_default()
             .insert(connection_id);
 
-        // Whether this is a connection requested by this behaviour.
-        if let Some(&(relayed_connection_id, _locally_initiated)) =
-            self.direct_to_relayed_connections.get(&connection_id)
-        {
-            // Clean up attempt tracking if still present.
-            // With rapid-fire bursts, multiple dials may succeed — only the first
-            // one emits an event (via holepunch_in_progress check below).
-            self.outgoing_direct_connection_attempts
-                .remove(&(relayed_connection_id, peer));
-
-            // Only emit a success event for the first successful dial.
-            // Subsequent burst dials that succeed are silently accepted
-            // (the connection is still valid, just no duplicate event).
-            if self.holepunch_in_progress.remove(&peer) {
-                self.queued_events.extend([ToSwarm::GenerateEvent(Event {
-                    remote_peer_id: peer,
-                    result: Ok(connection_id),
-                })]);
-            }
+        if let Some(relayed_connection_id) = self.attempt_dialing(connection_id) {
+            self.attempts.remove(&relayed_connection_id);
+            self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
+                remote_peer_id: peer,
+                relayed_connection_id,
+                result: Ok(connection_id),
+            }));
         }
         Ok(Either::Right(dummy::ConnectionHandler))
     }
@@ -581,74 +531,42 @@ impl NetworkBehaviour for Behaviour {
         connection_id: ConnectionId,
         handler_event: THandlerOutEvent<Self>,
     ) {
-        let relayed_connection_id = match handler_event.as_ref() {
-            Either::Left(_) => connection_id,
-            Either::Right(_) => match self.direct_to_relayed_connections.get(&connection_id) {
-                None => {
-                    // If the connection ID is unknown to us, it means we didn't create it so ignore
-                    // any event coming from it.
-                    return;
-                }
-                Some(&(relayed_connection_id, _)) => relayed_connection_id,
-            },
+        let handler_event = match handler_event {
+            Either::Left(handler_event) => handler_event,
+            // TODO: remove when Rust 1.82 is MSRV
+            #[allow(unreachable_patterns)]
+            Either::Right(never) => libp2p_core::util::unreachable(never),
         };
 
         match handler_event {
-            Either::Left(handler::relayed::Event::InboundConnectNegotiated { remote_addrs }) => {
+            handler::relayed::Event::InboundConnectNegotiated { remote_addrs } => {
                 tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as dialer");
-
-                self.holepunch_in_progress.insert(event_source);
-                *self
-                    .outgoing_direct_connection_attempts
-                    .entry((relayed_connection_id, event_source))
-                    .or_default() += 1;
-                self.initiate_hole_punch_dials(
-                    event_source,
-                    remote_addrs,
-                    relayed_connection_id,
-                    false, // not locally initiated
-                    false, // no role override
-                );
+                self.start_round(event_source, connection_id, false, remote_addrs);
             }
-            Either::Left(handler::relayed::Event::InboundConnectFailed { error }) => {
-                self.holepunch_in_progress.remove(&event_source);
+            handler::relayed::Event::OutboundConnectNegotiated { remote_addrs } => {
+                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener");
+                self.start_round(event_source, connection_id, true, remote_addrs);
+            }
+            handler::relayed::Event::InboundConnectFailed { error } => {
+                self.attempts.remove(&connection_id);
                 self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
                     remote_peer_id: event_source,
+                    relayed_connection_id: connection_id,
                     result: Err(Error {
                         inner: InnerError::InboundError(error),
                     }),
                 }));
             }
-            Either::Left(handler::relayed::Event::OutboundConnectFailed { error }) => {
-                self.holepunch_in_progress.remove(&event_source);
+            handler::relayed::Event::OutboundConnectFailed { error } => {
+                self.attempts.remove(&connection_id);
                 self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
                     remote_peer_id: event_source,
+                    relayed_connection_id: connection_id,
                     result: Err(Error {
                         inner: InnerError::OutboundError(error),
                     }),
                 }));
-
-                // Maybe treat these as transient and retry?
             }
-            Either::Left(handler::relayed::Event::OutboundConnectNegotiated { remote_addrs }) => {
-                tracing::debug!(target=%event_source, addresses=?remote_addrs, "Attempting to hole-punch as listener");
-
-                self.holepunch_in_progress.insert(event_source);
-                *self
-                    .outgoing_direct_connection_attempts
-                    .entry((relayed_connection_id, event_source))
-                    .or_default() += 1;
-                self.initiate_hole_punch_dials(
-                    event_source,
-                    remote_addrs,
-                    relayed_connection_id,
-                    true, // locally initiated
-                    true, // override role
-                );
-            }
-            // TODO: remove when Rust 1.82 is MSRV
-            #[allow(unreachable_patterns)]
-            Either::Right(never) => libp2p_core::util::unreachable(never),
         };
     }
 
@@ -661,67 +579,33 @@ impl NetworkBehaviour for Behaviour {
             return Poll::Ready(event);
         }
 
-        // Drive pending rapid-fire bursts.
-        // Check if any burst timer has fired and emit the next dial.
-        let mut i = 0;
-        while i < self.pending_bursts.len() {
-            if self.pending_bursts[i].remaining == 0 {
-                self.pending_bursts.swap_remove(i);
+        let burst_interval = self.config.hole_punch_burst_interval;
+        for (relayed_connection_id, attempt) in self.attempts.iter_mut() {
+            let Some(burst) = attempt.burst.as_mut() else {
+                continue;
+            };
+            if burst.delay.as_mut().poll(cx).is_pending() {
                 continue;
             }
 
-            // If the hole-punch already succeeded for this peer, cancel remaining bursts.
-            if !self
-                .holepunch_in_progress
-                .contains(&self.pending_bursts[i].peer_id)
-            {
-                tracing::debug!(
-                    peer = %self.pending_bursts[i].peer_id,
-                    remaining = self.pending_bursts[i].remaining,
-                    "Cancelling remaining burst dials — hole-punch already completed"
-                );
-                self.pending_bursts.swap_remove(i);
-                continue;
+            let addresses = burst.addresses.clone();
+            let remaining = burst.remaining.get() - 1;
+            match NonZeroUsize::new(remaining) {
+                Some(remaining) => {
+                    burst.remaining = remaining;
+                    burst.delay = Box::pin(Delay::new(burst_interval));
+                }
+                None => attempt.burst = None,
             }
 
-            match self.pending_bursts[i].delay.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    let burst = &self.pending_bursts[i];
-                    let peer_id = burst.peer_id;
-                    let addresses = burst.addresses.clone();
-                    let relayed_connection_id = burst.relayed_connection_id;
-                    let locally_initiated = burst.locally_initiated;
-                    let override_role = burst.override_role;
-
-                    self.pending_bursts[i].remaining -= 1;
-                    let remaining = self.pending_bursts[i].remaining;
-
-                    let opts = self.create_hole_punch_dial(
-                        peer_id,
-                        addresses,
-                        relayed_connection_id,
-                        locally_initiated,
-                        override_role,
-                    );
-
-                    tracing::debug!(
-                        peer = %peer_id,
-                        remaining,
-                        "Firing burst dial"
-                    );
-
-                    // Reset timer for next burst.
-                    if remaining > 0 {
-                        self.pending_bursts[i].delay =
-                            Box::pin(Delay::new(self.config.hole_punch_burst_interval));
-                    }
-
-                    return Poll::Ready(ToSwarm::Dial { opts });
-                }
-                Poll::Pending => {
-                    i += 1;
-                }
-            }
+            tracing::debug!(
+                peer = %attempt.peer,
+                relayed_connection = %relayed_connection_id,
+                remaining,
+                "Firing burst dial"
+            );
+            let opts = attempt.dial(addresses);
+            return Poll::Ready(ToSwarm::Dial { opts });
         }
 
         Poll::Pending
@@ -749,9 +633,17 @@ fn is_quic(addr: &Multiaddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, iter, thread};
+
+    use futures::{executor::block_on, future::poll_fn, task::noop_waker_ref};
     use libp2p_core::multiaddr::Protocol;
+    use libp2p_swarm::DialError;
 
     use super::*;
+
+    const BURST: usize = 4;
+
+    type Action = ToSwarm<Event, THandlerInEvent<Behaviour>>;
 
     fn peer_id() -> PeerId {
         PeerId::random()
@@ -759,6 +651,295 @@ mod tests {
 
     fn memory_addr(port: u64) -> Multiaddr {
         Multiaddr::empty().with(Protocol::Memory(port))
+    }
+
+    fn tcp_addr() -> Multiaddr {
+        "/ip4/192.0.2.1/tcp/4001".parse().unwrap()
+    }
+
+    fn quic_addr() -> Multiaddr {
+        "/ip4/192.0.2.1/udp/4001/quic-v1".parse().unwrap()
+    }
+
+    fn hole_punching_behaviour() -> Behaviour {
+        Behaviour::with_config(
+            peer_id(),
+            Config::default()
+                .with_hole_punch_burst_count(BURST)
+                .with_hole_punch_burst_interval(Duration::from_millis(1)),
+        )
+    }
+
+    fn negotiate(
+        behaviour: &mut Behaviour,
+        peer: PeerId,
+        relayed: ConnectionId,
+        locally_initiated: bool,
+        remote_addrs: Vec<Multiaddr>,
+    ) {
+        let event = if locally_initiated {
+            handler::relayed::Event::OutboundConnectNegotiated { remote_addrs }
+        } else {
+            handler::relayed::Event::InboundConnectNegotiated { remote_addrs }
+        };
+        behaviour.on_connection_handler_event(peer, relayed, Either::Left(event));
+    }
+
+    fn next(behaviour: &mut Behaviour) -> Action {
+        block_on(poll_fn(|cx| behaviour.poll(cx)))
+    }
+
+    /// Polls once after the burst interval has passed, so a burst that is still pending fires.
+    fn poll_idle(behaviour: &mut Behaviour) -> Option<Action> {
+        thread::sleep(Duration::from_millis(20));
+        match behaviour.poll(&mut Context::from_waker(noop_waker_ref())) {
+            Poll::Ready(action) => Some(action),
+            Poll::Pending => None,
+        }
+    }
+
+    fn dials(behaviour: &mut Behaviour, count: usize) -> Vec<ConnectionId> {
+        (0..count)
+            .map(|_| match next(behaviour) {
+                ToSwarm::Dial { opts } => opts.connection_id(),
+                other => panic!("expected a dial, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn fail(behaviour: &mut Behaviour, connection_id: ConnectionId) {
+        behaviour.on_swarm_event(FromSwarm::DialFailure(DialFailure {
+            peer_id: None,
+            error: &DialError::Aborted,
+            connection_id,
+        }));
+    }
+
+    fn event(action: Action) -> Event {
+        match action {
+            ToSwarm::GenerateEvent(event) => event,
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+
+    fn assert_connect(action: Action, relayed: ConnectionId) {
+        match action {
+            ToSwarm::NotifyHandler {
+                handler: NotifyHandler::One(id),
+                event: Either::Left(handler::relayed::Command::Connect),
+                ..
+            } if id == relayed => {}
+            other => panic!("expected a connect on {relayed}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_burst_queues_one_connect_on_listener() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+
+        negotiate(
+            &mut behaviour,
+            peer,
+            relayed,
+            true,
+            vec![tcp_addr(), quic_addr()],
+        );
+        for _ in 0..1 + BURST {
+            let dial = dials(&mut behaviour, 1)[0];
+            fail(&mut behaviour, dial);
+        }
+
+        assert_connect(next(&mut behaviour), relayed);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn failed_bursts_emit_one_error_on_dialer_at_max() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+        let mut late = None;
+
+        for round in 1..=MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
+            negotiate(&mut behaviour, peer, relayed, false, vec![quic_addr()]);
+            let mut round_dials = dials(&mut behaviour, BURST);
+            if round == 1 {
+                late = round_dials.pop();
+            }
+            for dial in round_dials {
+                fail(&mut behaviour, dial);
+            }
+            assert!(poll_idle(&mut behaviour).is_none());
+        }
+
+        let late = late.unwrap();
+        fail(&mut behaviour, late);
+        let event = event(next(&mut behaviour));
+        assert_eq!(event.remote_peer_id, peer);
+        assert_eq!(event.relayed_connection_id, relayed);
+        assert!(matches!(
+            event.result,
+            Err(Error {
+                inner: InnerError::AttemptsExceeded(MAX_NUMBER_OF_UPGRADE_ATTEMPTS)
+            })
+        ));
+
+        fail(&mut behaviour, late);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn outbound_success_reports_once_and_cancels_burst() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+
+        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
+        let burst_dials = dials(&mut behaviour, 2);
+        behaviour
+            .handle_established_outbound_connection(
+                burst_dials[0],
+                peer,
+                &quic_addr(),
+                Endpoint::Listener,
+                PortUse::Reuse,
+            )
+            .unwrap();
+
+        let event = event(next(&mut behaviour));
+        assert_eq!(event.relayed_connection_id, relayed);
+        assert_eq!(event.result.unwrap(), burst_dials[0]);
+
+        fail(&mut behaviour, burst_dials[1]);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn inbound_success_reports_once_and_cancels_burst() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+        let direct = ConnectionId::new_unchecked(2);
+
+        negotiate(&mut behaviour, peer, relayed, false, vec![quic_addr()]);
+        let burst_dials = dials(&mut behaviour, 2);
+        behaviour
+            .handle_established_inbound_connection(direct, peer, &tcp_addr(), &tcp_addr())
+            .unwrap();
+
+        let event = event(next(&mut behaviour));
+        assert_eq!(event.relayed_connection_id, relayed);
+        assert_eq!(event.result.unwrap(), direct);
+
+        for dial in burst_dials {
+            fail(&mut behaviour, dial);
+        }
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn finishing_one_relayed_connection_keeps_the_others_burst() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed_1 = ConnectionId::new_unchecked(1);
+        let relayed_2 = ConnectionId::new_unchecked(2);
+
+        negotiate(&mut behaviour, peer, relayed_1, true, vec![quic_addr()]);
+        negotiate(&mut behaviour, peer, relayed_2, true, vec![quic_addr()]);
+        let first_dials = dials(&mut behaviour, 2);
+        behaviour
+            .handle_established_outbound_connection(
+                first_dials[0],
+                peer,
+                &quic_addr(),
+                Endpoint::Listener,
+                PortUse::Reuse,
+            )
+            .unwrap();
+        assert_eq!(event(next(&mut behaviour)).relayed_connection_id, relayed_1);
+
+        let rest = dials(&mut behaviour, BURST - 1);
+        for dial in iter::once(first_dials[1]).chain(rest) {
+            fail(&mut behaviour, dial);
+        }
+
+        assert_connect(next(&mut behaviour), relayed_2);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn inbound_success_completes_every_attempt_with_the_peer() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed_1 = ConnectionId::new_unchecked(1);
+        let relayed_2 = ConnectionId::new_unchecked(2);
+        let direct = ConnectionId::new_unchecked(3);
+
+        negotiate(&mut behaviour, peer, relayed_1, true, vec![quic_addr()]);
+        negotiate(&mut behaviour, peer, relayed_2, true, vec![quic_addr()]);
+        dials(&mut behaviour, 2);
+        behaviour
+            .handle_established_inbound_connection(direct, peer, &tcp_addr(), &tcp_addr())
+            .unwrap();
+
+        let completed = (0..2)
+            .map(|_| event(next(&mut behaviour)).relayed_connection_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(completed, HashSet::from([relayed_1, relayed_2]));
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn handshake_failure_ends_the_attempt() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+
+        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
+        let first_dial = dials(&mut behaviour, 1)[0];
+        behaviour.on_connection_handler_event(
+            peer,
+            relayed,
+            Either::Left(handler::relayed::Event::OutboundConnectFailed {
+                error: protocol::outbound::Error::Unsupported,
+            }),
+        );
+
+        let event = event(next(&mut behaviour));
+        assert_eq!(event.relayed_connection_id, relayed);
+        assert!(event.result.is_err());
+
+        fail(&mut behaviour, first_dial);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn closing_the_relayed_connection_drops_its_attempt() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+        let relayed_addr: Multiaddr =
+            format!("/ip4/192.0.2.2/tcp/4001/p2p/{}/p2p-circuit", peer_id())
+                .parse()
+                .unwrap();
+
+        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
+        let first_dial = dials(&mut behaviour, 1)[0];
+        behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+            peer_id: peer,
+            connection_id: relayed,
+            endpoint: &ConnectedPoint::Listener {
+                local_addr: relayed_addr,
+                send_back_addr: tcp_addr(),
+            },
+            cause: None,
+            remaining_established: 0,
+        }));
+
+        fail(&mut behaviour, first_dial);
+        assert!(poll_idle(&mut behaviour).is_none());
     }
 
     #[test]

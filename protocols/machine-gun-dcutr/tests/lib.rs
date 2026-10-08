@@ -18,19 +18,21 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::time::Duration;
+use std::{sync::mpsc, time::Duration};
 
+use futures::{future, StreamExt};
+use futures_timer::Delay;
 use libp2p_core::{
     multiaddr::{Multiaddr, Protocol},
     transport::{upgrade::Version, MemoryTransport, Transport},
 };
-use libp2p_machine_gun_dcutr as dcutr;
 use libp2p_identify as identify;
 use libp2p_identity as identity;
 use libp2p_identity::PeerId;
+use libp2p_machine_gun_dcutr as dcutr;
 use libp2p_plaintext as plaintext;
 use libp2p_relay as relay;
-use libp2p_swarm::{Config, NetworkBehaviour, Swarm, SwarmEvent};
+use libp2p_swarm::{Config, ConnectionId, NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p_swarm_test::SwarmExt as _;
 use tracing_subscriber::EnvFilter;
 
@@ -41,8 +43,8 @@ async fn connect() {
         .try_init();
 
     let mut relay = build_relay();
-    let mut dst = build_client();
-    let mut src = build_client();
+    let mut dst = build_client(dcutr::Config::default());
+    let mut src = build_client(dcutr::Config::default());
 
     // Have all swarms listen on a local TCP address.
     let (_, relay_tcp_addr) = relay.listen().with_tcp_addr_external().await;
@@ -65,12 +67,8 @@ async fn connect() {
 
     // Explicitly add hole-punch candidate addresses.
     // In a real application, these would be correlated with relay connections.
-    dst.behaviour_mut()
-        .dcutr
-        .add_address(dst_tcp_addr.clone());
-    src.behaviour_mut()
-        .dcutr
-        .add_address(src_tcp_addr);
+    dst.behaviour_mut().dcutr.add_address(dst_tcp_addr.clone());
+    src.behaviour_mut().dcutr.add_address(src_tcp_addr);
 
     wait_for_reservation(
         &mut dst,
@@ -81,7 +79,7 @@ async fn connect() {
     .await;
     tokio::spawn(dst.loop_on_next());
 
-    src.dial_and_wait(dst_relayed_addr.clone()).await;
+    let relayed_conn_id = dial_relayed(&mut src, dst_relayed_addr).await;
 
     let dst_addr = dst_tcp_addr.with(Protocol::P2p(dst_peer_id));
 
@@ -96,17 +94,107 @@ async fn connect() {
         })
         .await;
 
-    let reported_conn_id = src
+    let event = src
         .wait(move |e| match e {
-            SwarmEvent::Behaviour(ClientEvent::Dcutr(dcutr::Event {
-                result: Ok(connection_id),
-                ..
-            })) => Some(connection_id),
+            SwarmEvent::Behaviour(ClientEvent::Dcutr(event)) => Some(event),
             _ => None,
         })
         .await;
 
-    assert_eq!(established_conn_id, reported_conn_id);
+    assert_eq!(event.relayed_connection_id, relayed_conn_id);
+    assert_eq!(event.result.unwrap(), established_conn_id);
+}
+
+#[tokio::test]
+async fn failed_bursts_produce_one_error_per_side() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
+    let config = dcutr::Config::default()
+        .with_hole_punch_burst_count(5)
+        .with_hole_punch_burst_interval(Duration::from_millis(5));
+    let mut relay = build_relay();
+    let mut dst = build_client(config.clone());
+    let mut src = build_client(config);
+
+    let (_, relay_tcp_addr) = relay.listen().with_tcp_addr_external().await;
+    let relay_peer_id = *relay.local_peer_id();
+    let dst_peer_id = *dst.local_peer_id();
+    tokio::spawn(relay.loop_on_next());
+
+    let dst_relayed_addr = relay_tcp_addr
+        .with(Protocol::P2p(relay_peer_id))
+        .with(Protocol::P2pCircuit)
+        .with(Protocol::P2p(dst_peer_id));
+    dst.listen_on(dst_relayed_addr.clone()).unwrap();
+
+    // Neither client has a QUIC transport, so every dial of every burst fails at once.
+    dst.behaviour_mut()
+        .dcutr
+        .add_address("/ip4/127.0.0.1/udp/1/quic-v1".parse().unwrap());
+    src.behaviour_mut()
+        .dcutr
+        .add_address("/ip4/127.0.0.1/udp/2/quic-v1".parse().unwrap());
+
+    wait_for_reservation(&mut dst, dst_relayed_addr.clone(), relay_peer_id, false).await;
+    let (dst_events_tx, dst_events) = mpsc::channel();
+    tokio::spawn(async move {
+        loop {
+            if let SwarmEvent::Behaviour(ClientEvent::Dcutr(event)) = dst.select_next_some().await {
+                let _ = dst_events_tx.send(event);
+            }
+        }
+    });
+
+    let relayed_conn_id = dial_relayed(&mut src, dst_relayed_addr).await;
+    let src_event = src
+        .wait(|e| match e {
+            SwarmEvent::Behaviour(ClientEvent::Dcutr(event)) => Some(event),
+            _ => None,
+        })
+        .await;
+    assert_eq!(src_event.remote_peer_id, dst_peer_id);
+    assert_eq!(src_event.relayed_connection_id, relayed_conn_id);
+    assert_attempts_exceeded(src_event);
+
+    let src_quiet = async {
+        loop {
+            if let SwarmEvent::Behaviour(ClientEvent::Dcutr(event)) = src.select_next_some().await {
+                panic!("Unexpected second event on the dialer: {event:?}");
+            }
+        }
+    };
+    future::select(Box::pin(src_quiet), Delay::new(Duration::from_millis(500))).await;
+
+    let dst_events = dst_events.try_iter().collect::<Vec<_>>();
+    assert_eq!(dst_events.len(), 1, "{dst_events:?}");
+    let dst_event = dst_events.into_iter().next().unwrap();
+    assert_eq!(dst_event.remote_peer_id, *src.local_peer_id());
+    assert_attempts_exceeded(dst_event);
+}
+
+fn assert_attempts_exceeded(event: dcutr::Event) {
+    let error = event.result.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Giving up after 3 dial attempts"),
+        "{error}"
+    );
+}
+
+async fn dial_relayed(src: &mut Swarm<Client>, addr: Multiaddr) -> ConnectionId {
+    src.dial(addr.clone()).unwrap();
+    src.wait(move |e| match e {
+        SwarmEvent::ConnectionEstablished {
+            endpoint,
+            connection_id,
+            ..
+        } => (*endpoint.get_remote_address() == addr).then_some(connection_id),
+        _ => None,
+    })
+    .await
 }
 
 fn build_relay() -> Swarm<Relay> {
@@ -136,7 +224,7 @@ struct Relay {
     identify: identify::Behaviour,
 }
 
-fn build_client() -> Swarm<Client> {
+fn build_client(dcutr_config: dcutr::Config) -> Swarm<Client> {
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = local_key.public().to_peer_id();
 
@@ -154,7 +242,7 @@ fn build_client() -> Swarm<Client> {
         transport,
         Client {
             relay: behaviour,
-            dcutr: dcutr::Behaviour::new(local_peer_id),
+            dcutr: dcutr::Behaviour::with_config(local_peer_id, dcutr_config),
             identify: identify::Behaviour::new(identify::Config::new(
                 "/client".to_owned(),
                 local_key.public(),

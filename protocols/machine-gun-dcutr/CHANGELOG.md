@@ -1,3 +1,13 @@
+## 0.14.0
+
+- Count a burst of hole-punch dials as one attempt.
+  A failed burst now queues one retry or emits one `Event`, where it used to do so for every failed dial.
+  A success emits one `Ok` and silences the late failures of the rest of the burst.
+  Two relayed connections to the same peer no longer cancel each other's bursts.
+- Add `Event::relayed_connection_id`, the relayed connection the hole-punch tried to upgrade.
+  This is a breaking change to `Event`.
+- Add `Behaviour::address_candidates` to read the hole-punch candidates that are advertised.
+
 ## 0.13.0
 
 - Deprecate `void` crate.
