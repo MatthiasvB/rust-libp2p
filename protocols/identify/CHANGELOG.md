@@ -10,6 +10,11 @@
 - Revert migration to `quick-protobuf`, migrate back to `prost`.
   See [PR 6363](https://github.com/libp2p/rust-libp2p/pull/6363).
 
+- Trim our own identify message to the 4096-byte receive limit by dropping the lowest-ranked addresses, ranked as go-libp2p does.
+  A node with many addresses, for example many relay reservations, used to send a message that every receiver rejected.
+  The signed peer record carries the same trimmed addresses as `listen_addrs`.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+
 ## 0.47.0
 
 - Implement optional `signedPeerRecord` support for identify messages.

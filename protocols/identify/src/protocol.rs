@@ -26,11 +26,12 @@ use libp2p_core::{Multiaddr, PeerRecord, SignedEnvelope, multiaddr};
 use libp2p_identity as identity;
 use libp2p_identity::PublicKey;
 use libp2p_swarm::StreamProtocol;
+use prost::Message;
 use thiserror::Error;
 
 use crate::proto;
 
-const MAX_MESSAGE_SIZE_BYTES: usize = 4096;
+pub(crate) const MAX_MESSAGE_SIZE_BYTES: usize = 4096;
 
 pub const PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/ipfs/id/1.0.0");
 
@@ -99,22 +100,7 @@ where
 {
     tracing::trace!("Sending: {:?}", info);
 
-    let listen_addrs = info.listen_addrs.iter().map(|addr| addr.to_vec()).collect();
-
-    let pubkey_bytes = info.public_key.encode_protobuf();
-
-    let message = proto::Identify {
-        agent_version: Some(info.agent_version.clone()),
-        protocol_version: Some(info.protocol_version.clone()),
-        public_key: Some(pubkey_bytes),
-        listen_addrs,
-        observed_addr: Some(info.observed_addr.to_vec()),
-        protocols: info.protocols.iter().map(|p| p.to_string()).collect(),
-        signed_peer_record: info
-            .signed_peer_record
-            .clone()
-            .map(|r| r.into_protobuf_encoding()),
-    };
+    let message = proto::Identify::from(&info);
 
     let mut framed_io = FramedWrite::new(
         io,
@@ -125,6 +111,29 @@ where
     framed_io.close().await?;
 
     Ok(info)
+}
+
+/// The length of `info` encoded as a message, which the receiver checks against
+/// [`MAX_MESSAGE_SIZE_BYTES`].
+pub(crate) fn encoded_len(info: &Info) -> usize {
+    proto::Identify::from(info).encoded_len()
+}
+
+impl From<&Info> for proto::Identify {
+    fn from(info: &Info) -> Self {
+        proto::Identify {
+            agent_version: Some(info.agent_version.clone()),
+            protocol_version: Some(info.protocol_version.clone()),
+            public_key: Some(info.public_key.encode_protobuf()),
+            listen_addrs: info.listen_addrs.iter().map(|addr| addr.to_vec()).collect(),
+            observed_addr: Some(info.observed_addr.to_vec()),
+            protocols: info.protocols.iter().map(|p| p.to_string()).collect(),
+            signed_peer_record: info
+                .signed_peer_record
+                .clone()
+                .map(|r| r.into_protobuf_encoding()),
+        }
+    }
 }
 
 pub(crate) async fn recv_push<T>(socket: T) -> Result<PushInfo, UpgradeError>
@@ -293,7 +302,6 @@ mod tests {
 
     use libp2p_core::PeerRecord;
     use libp2p_identity as identity;
-    use prost::Message;
 
     use super::*;
 

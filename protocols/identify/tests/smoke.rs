@@ -5,8 +5,9 @@ use std::{
 };
 
 use futures::StreamExt;
+use libp2p_core::{Multiaddr, multiaddr::Protocol, multihash::Multihash};
 use libp2p_identify as identify;
-use libp2p_identity::Keypair;
+use libp2p_identity::{Keypair, PeerId};
 use libp2p_swarm::{Swarm, SwarmEvent};
 use libp2p_swarm_test::SwarmExt;
 use tracing_subscriber::EnvFilter;
@@ -482,4 +483,103 @@ async fn reject_mismatched_public_key() {
             .any(|e| matches!(e, SwarmEvent::Behaviour(identify::Event::Received { .. }))),
         "should emit no received events as received public key won't match remote peer",
     );
+}
+
+#[tokio::test]
+async fn trims_own_addresses_to_fit_the_message_limit() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
+    let mut sender = Swarm::new_ephemeral_tokio(|identity| {
+        identify::Behaviour::new(identify::Config::new_with_signed_peer_record(
+            "a".to_string(),
+            &identity,
+        ))
+    });
+    let sender_peer_id = *sender.local_peer_id();
+    let mut receiver = Swarm::new_ephemeral_tokio(|identity| {
+        identify::Behaviour::new(identify::Config::new("b".to_string(), identity.public()))
+    });
+
+    // 20 is the swarm's cap on external addresses. Best transport first.
+    let by_transport = circuit_addresses_by_transport(4, sender_peer_id);
+    for address in by_transport.iter().flatten() {
+        sender.add_external_address(address.clone());
+    }
+    assert_eq!(sender.external_addresses().count(), 20);
+
+    sender.listen().await;
+    receiver.listen().with_memory_addr_external().await;
+    sender.connect(&mut receiver).await;
+    tokio::spawn(sender.loop_on_next());
+
+    let info = receiver
+        .wait(|event| match event {
+            SwarmEvent::Behaviour(identify::Event::Received { peer_id, info, .. })
+                if peer_id == sender_peer_id =>
+            {
+                Some(info)
+            }
+            SwarmEvent::Behaviour(identify::Event::Error { error, .. }) => panic!("{error}"),
+            _ => None,
+        })
+        .await;
+
+    let received = |addresses: &[Multiaddr]| {
+        addresses
+            .iter()
+            .filter(|address| info.listen_addrs.contains(address))
+            .count()
+    };
+    let received_by_transport = by_transport.each_ref().map(|addresses| received(addresses));
+    assert_eq!(received_by_transport[0], 4, "every QUIC address");
+    assert_eq!(received_by_transport[1], 4, "every TCP address");
+    let first_incomplete = by_transport
+        .iter()
+        .zip(received_by_transport)
+        .position(|(addresses, received)| received < addresses.len())
+        .expect("some addresses to be trimmed");
+    assert!(
+        received_by_transport[first_incomplete + 1..]
+            .iter()
+            .all(|received| *received == 0),
+        "only the lowest-ranked addresses are trimmed: {received_by_transport:?}"
+    );
+}
+
+/// Circuit addresses through `relays` relays, grouped by the transport to the relay, best first.
+fn circuit_addresses_by_transport(relays: u8, local_peer_id: PeerId) -> [Vec<Multiaddr>; 5] {
+    let certhash = |seed| Protocol::Certhash(Multihash::wrap(0x12, &[seed; 32]).unwrap());
+    let mut by_transport: [Vec<Multiaddr>; 5] = Default::default();
+    for i in 0..relays {
+        let relay = PeerId::random();
+        let ip = Multiaddr::empty().with(Protocol::Ip4([88, 99, 240, 155 + i].into()));
+        let transports = [
+            ip.clone().with(Protocol::Udp(4001)).with(Protocol::QuicV1),
+            ip.clone().with(Protocol::Tcp(4001)),
+            ip.clone()
+                .with(Protocol::Tcp(4002))
+                .with(Protocol::Tls)
+                .with(Protocol::Ws("/".into())),
+            ip.clone()
+                .with(Protocol::Udp(4001))
+                .with(Protocol::QuicV1)
+                .with(Protocol::WebTransport)
+                .with(certhash(1))
+                .with(certhash(2)),
+            ip.with(Protocol::Udp(4003))
+                .with(Protocol::WebRTCDirect)
+                .with(certhash(3)),
+        ];
+        for (addresses, transport) in by_transport.iter_mut().zip(transports) {
+            addresses.push(
+                transport
+                    .with(Protocol::P2p(relay))
+                    .with(Protocol::P2pCircuit)
+                    .with(Protocol::P2p(local_peer_id)),
+            );
+        }
+    }
+    by_transport
 }
