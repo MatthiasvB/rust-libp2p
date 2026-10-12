@@ -163,6 +163,8 @@ enum InnerError {
     InboundError(protocol::inbound::Error),
     #[error("Outbound stream error: {0}")]
     OutboundError(protocol::outbound::Error),
+    #[error("Relayed connection closed before the hole-punch finished")]
+    RelayedConnectionClosed,
 }
 
 pub struct Behaviour {
@@ -201,6 +203,9 @@ struct Attempt {
     /// Direct dials that have neither failed nor succeeded yet.
     outstanding: HashSet<ConnectionId>,
     burst: Option<PendingBurst>,
+    /// Whether the relayed connection has closed. The attempt then ends with its current round,
+    /// so this is only set while dials are outstanding or a burst is pending.
+    relayed_closed: bool,
 }
 
 /// The QUIC dials of an attempt that have not been fired yet.
@@ -218,6 +223,7 @@ impl Attempt {
             locally_initiated,
             outstanding: HashSet::new(),
             burst: None,
+            relayed_closed: false,
         }
     }
 
@@ -395,26 +401,33 @@ impl Behaviour {
             return;
         }
 
-        let peer_id = attempt.peer;
-        if attempt.number < MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
+        let error = if attempt.number >= MAX_NUMBER_OF_UPGRADE_ATTEMPTS {
+            InnerError::AttemptsExceeded(MAX_NUMBER_OF_UPGRADE_ATTEMPTS)
+        } else if attempt.relayed_closed {
+            InnerError::RelayedConnectionClosed
+        } else {
             // The remote drives the retries if we are the dialer on the relayed connection.
             if attempt.locally_initiated {
                 self.queued_events.push_back(ToSwarm::NotifyHandler {
                     handler: NotifyHandler::One(relayed_connection_id),
-                    peer_id,
+                    peer_id: attempt.peer,
                     event: Either::Left(handler::relayed::Command::Connect),
                 });
             }
             return;
-        }
+        };
+        self.fail_attempt(relayed_connection_id, error);
+    }
 
-        self.attempts.remove(&relayed_connection_id);
+    fn fail_attempt(&mut self, relayed_connection_id: ConnectionId, error: InnerError) {
+        let attempt = self
+            .attempts
+            .remove(&relayed_connection_id)
+            .expect("attempt to exist");
         self.queued_events.push_back(ToSwarm::GenerateEvent(Event {
-            remote_peer_id: peer_id,
+            remote_peer_id: attempt.peer,
             relayed_connection_id,
-            result: Err(Error {
-                inner: InnerError::AttemptsExceeded(MAX_NUMBER_OF_UPGRADE_ATTEMPTS),
-            }),
+            result: Err(Error { inner: error }),
         }));
     }
 
@@ -428,7 +441,13 @@ impl Behaviour {
         }: ConnectionClosed,
     ) {
         if connected_point.is_relayed() {
-            self.attempts.remove(&connection_id);
+            if let Some(attempt) = self.attempts.get_mut(&connection_id) {
+                if attempt.outstanding.is_empty() && attempt.burst.is_none() {
+                    self.fail_attempt(connection_id, InnerError::RelayedConnectionClosed);
+                } else {
+                    attempt.relayed_closed = true;
+                }
+            }
             return;
         }
 
@@ -689,6 +708,13 @@ mod tests {
         block_on(poll_fn(|cx| behaviour.poll(cx)))
     }
 
+    fn ready(behaviour: &mut Behaviour) -> Action {
+        match behaviour.poll(&mut Context::from_waker(noop_waker_ref())) {
+            Poll::Ready(action) => action,
+            Poll::Pending => panic!("expected a queued action"),
+        }
+    }
+
     /// Polls once after the burst interval has passed, so a burst that is still pending fires.
     fn poll_idle(behaviour: &mut Behaviour) -> Option<Action> {
         thread::sleep(Duration::from_millis(20));
@@ -915,18 +941,11 @@ mod tests {
         assert!(poll_idle(&mut behaviour).is_none());
     }
 
-    #[test]
-    fn closing_the_relayed_connection_drops_its_attempt() {
-        let mut behaviour = hole_punching_behaviour();
-        let peer = peer_id();
-        let relayed = ConnectionId::new_unchecked(1);
+    fn close_relayed(behaviour: &mut Behaviour, peer: PeerId, relayed: ConnectionId) {
         let relayed_addr: Multiaddr =
             format!("/ip4/192.0.2.2/tcp/4001/p2p/{}/p2p-circuit", peer_id())
                 .parse()
                 .unwrap();
-
-        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
-        let first_dial = dials(&mut behaviour, 1)[0];
         behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
             peer_id: peer,
             connection_id: relayed,
@@ -937,8 +956,82 @@ mod tests {
             cause: None,
             remaining_established: 0,
         }));
+    }
 
-        fail(&mut behaviour, first_dial);
+    fn assert_relayed_connection_closed(event: Event, relayed: ConnectionId) {
+        assert_eq!(event.relayed_connection_id, relayed);
+        assert!(matches!(
+            event.result,
+            Err(Error {
+                inner: InnerError::RelayedConnectionClosed
+            })
+        ));
+    }
+
+    #[test]
+    fn closing_the_relayed_connection_mid_round_still_reports_the_failure() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+
+        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
+        let first_dial = dials(&mut behaviour, 1)[0];
+        close_relayed(&mut behaviour, peer, relayed);
+
+        let rest = (1..BURST)
+            .map(|_| match poll_idle(&mut behaviour) {
+                Some(ToSwarm::Dial { opts }) => opts.connection_id(),
+                other => panic!("expected the burst to keep firing, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        for dial in iter::once(first_dial).chain(rest) {
+            fail(&mut behaviour, dial);
+        }
+
+        assert_relayed_connection_closed(event(ready(&mut behaviour)), relayed);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn closing_the_relayed_connection_mid_round_still_reports_success() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+
+        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
+        let first_dial = dials(&mut behaviour, 1)[0];
+        close_relayed(&mut behaviour, peer, relayed);
+        behaviour
+            .handle_established_outbound_connection(
+                first_dial,
+                peer,
+                &quic_addr(),
+                Endpoint::Listener,
+                PortUse::Reuse,
+            )
+            .unwrap();
+
+        let event = event(ready(&mut behaviour));
+        assert_eq!(event.relayed_connection_id, relayed);
+        assert_eq!(event.result.unwrap(), first_dial);
+        assert!(poll_idle(&mut behaviour).is_none());
+    }
+
+    #[test]
+    fn closing_the_relayed_connection_between_rounds_fails_at_once() {
+        let mut behaviour = hole_punching_behaviour();
+        let peer = peer_id();
+        let relayed = ConnectionId::new_unchecked(1);
+
+        negotiate(&mut behaviour, peer, relayed, true, vec![quic_addr()]);
+        for dial in dials(&mut behaviour, BURST) {
+            fail(&mut behaviour, dial);
+        }
+        assert_connect(next(&mut behaviour), relayed);
+
+        close_relayed(&mut behaviour, peer, relayed);
+
+        assert_relayed_connection_closed(event(ready(&mut behaviour)), relayed);
         assert!(poll_idle(&mut behaviour).is_none());
     }
 

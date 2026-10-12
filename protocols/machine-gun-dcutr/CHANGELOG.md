@@ -7,6 +7,8 @@
 - Add `Event::relayed_connection_id`, the relayed connection the hole-punch tried to upgrade.
   This is a breaking change to `Event`.
 - Add `Behaviour::address_candidates` to read the hole-punch candidates that are advertised.
+- Report the outcome of an attempt whose relayed connection closes mid-round.
+  The dials already in flight still decide it, and an attempt between rounds fails at once.
 
 ## 0.13.0
 
