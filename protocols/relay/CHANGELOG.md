@@ -16,6 +16,9 @@
   See [PR 6154](https://github.com/libp2p/rust-libp2p/pull/6154).
 - Expire external address when a relay listener is closed without a replacement reservation.
   See [PR 6285](https://github.com/libp2p/rust-libp2p/pull/6285).
+- Stop renewing a reservation after its relay listener was removed, and drop it on the connection handler right away.
+  Accepting a reservation that no listener uses anymore no longer panics with `Relay connection exist`.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
 
 ## 0.21.1
 - reduce allocations by replacing `get_or_insert` with `get_or_insert_with`

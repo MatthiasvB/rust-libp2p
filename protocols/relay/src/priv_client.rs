@@ -194,6 +194,19 @@ impl Behaviour {
             self.queued_actions
                 .push_back(ToSwarm::ExternalAddrExpired(addr));
         }
+
+        let relay_peer_id = self
+            .directly_connected_peers
+            .iter()
+            .find(|(_, connections)| connections.contains(&connection_id))
+            .map(|(peer_id, _)| *peer_id);
+        if let Some(relay_peer_id) = relay_peer_id {
+            self.queued_actions.push_back(ToSwarm::NotifyHandler {
+                peer_id: relay_peer_id,
+                handler: NotifyHandler::One(connection_id),
+                event: Either::Left(handler::In::Unreserve),
+            });
+        }
     }
 }
 
@@ -283,15 +296,21 @@ impl NetworkBehaviour for Behaviour {
 
         let event = match handler_event {
             handler::Event::ReservationReqAccepted { renewal, limit } => {
-                let (addr, status) = self
-                    .reservation_addresses
-                    .get_mut(&connection)
-                    .expect("Relay connection exist");
-
-                if !renewal && *status == ReservationStatus::Pending {
-                    *status = ReservationStatus::Confirmed;
-                    self.queued_actions
-                        .push_back(ToSwarm::ExternalAddrConfirmed(addr.clone()));
+                match self.reservation_addresses.get_mut(&connection) {
+                    Some((addr, status)) => {
+                        if !renewal && *status == ReservationStatus::Pending {
+                            *status = ReservationStatus::Confirmed;
+                            self.queued_actions
+                                .push_back(ToSwarm::ExternalAddrConfirmed(addr.clone()));
+                        }
+                    }
+                    // The listener was removed while the request was in flight.
+                    None => tracing::debug!(
+                        relay=%event_source,
+                        %connection,
+                        renewal,
+                        "Relay accepted a reservation that no listener uses anymore"
+                    ),
                 }
 
                 Event::ReservationReqAccepted {

@@ -65,6 +65,8 @@ pub enum In {
         dst_peer_id: PeerId,
         to_dial: oneshot::Sender<Result<priv_client::Connection, outbound_hop::ConnectError>>,
     },
+    /// No listener uses the reservation on this connection anymore.
+    Unreserve,
 }
 
 impl fmt::Debug for In {
@@ -78,6 +80,7 @@ impl fmt::Debug for In {
                 .debug_struct("In::EstablishCircuit")
                 .field("dst_peer_id", dst_peer_id)
                 .finish(),
+            In::Unreserve => f.debug_struct("In::Unreserve").finish(),
         }
     }
 }
@@ -256,6 +259,7 @@ impl ConnectionHandler for Handler {
             } => {
                 self.establish_new_circuit(to_dial, dst_peer_id);
             }
+            In::Unreserve => self.reservation.unreserve(),
         }
     }
 
@@ -517,6 +521,14 @@ impl Reservation {
         *self = Reservation::None;
     }
 
+    fn unreserve(&mut self) {
+        // A renewal in flight is left to complete, so that its acceptance is still reported as a
+        // renewal. Forwarding it to the closed listener then drops the reservation.
+        if let Reservation::Accepted { .. } = self {
+            *self = Reservation::None;
+        }
+    }
+
     fn forward_messages_to_transport_listener(&mut self, cx: &mut Context<'_>) {
         if let Reservation::Accepted {
             pending_msgs,
@@ -556,6 +568,10 @@ impl Reservation {
                 pending_msgs,
                 to_listener,
             } => match renewal_timeout.poll_unpin(cx) {
+                Poll::Ready(()) if to_listener.is_closed() => {
+                    tracing::debug!("Not renewing reservation because its listener is closed");
+                    (Reservation::None, Poll::Pending)
+                }
                 Poll::Ready(()) => (
                     Reservation::Renewing { pending_msgs },
                     Poll::Ready(Some(to_listener)),
@@ -596,5 +612,69 @@ fn into_connect_error(e: StreamUpgradeError<Infallible>) -> outbound_hop::Connec
         StreamUpgradeError::Apply(never) => libp2p_core::util::unreachable(never),
         StreamUpgradeError::NegotiationFailed => outbound_hop::ConnectError::Unsupported,
         StreamUpgradeError::Io(e) => outbound_hop::ConnectError::Io(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use futures::task::noop_waker_ref;
+
+    use super::*;
+
+    fn accepted_reservation(to_listener: mpsc::Sender<transport::ToListenerMsg>) -> Reservation {
+        Reservation::Accepted {
+            renewal_timeout: Delay::new(Duration::ZERO),
+            pending_msgs: VecDeque::new(),
+            to_listener,
+        }
+    }
+
+    fn poll_after_renewal_timeout(
+        reservation: &mut Reservation,
+    ) -> Poll<Option<mpsc::Sender<transport::ToListenerMsg>>> {
+        thread::sleep(Duration::from_millis(20));
+        reservation.poll(&mut Context::from_waker(noop_waker_ref()))
+    }
+
+    #[test]
+    fn renews_reservation_of_open_listener() {
+        let (to_listener, _from_handler) = mpsc::channel(0);
+        let mut reservation = accepted_reservation(to_listener);
+
+        assert!(poll_after_renewal_timeout(&mut reservation).is_ready());
+        assert!(matches!(reservation, Reservation::Renewing { .. }));
+    }
+
+    #[test]
+    fn drops_reservation_of_closed_listener_instead_of_renewing() {
+        let (to_listener, from_handler) = mpsc::channel(0);
+        drop(from_handler);
+        let mut reservation = accepted_reservation(to_listener);
+
+        assert!(poll_after_renewal_timeout(&mut reservation).is_pending());
+        assert!(!reservation.is_some());
+    }
+
+    #[test]
+    fn unreserve_drops_accepted_reservation() {
+        let (to_listener, _from_handler) = mpsc::channel(0);
+        let mut reservation = accepted_reservation(to_listener);
+
+        reservation.unreserve();
+
+        assert!(!reservation.is_some());
+    }
+
+    #[test]
+    fn unreserve_lets_renewal_in_flight_complete() {
+        let mut reservation = Reservation::Renewing {
+            pending_msgs: VecDeque::new(),
+        };
+
+        reservation.unreserve();
+
+        assert!(matches!(reservation, Reservation::Renewing { .. }));
     }
 }
