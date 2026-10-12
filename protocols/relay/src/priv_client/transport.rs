@@ -338,6 +338,7 @@ impl Listener {
                 reason,
             });
         self.is_closed = true;
+        self.from_behaviour.close();
 
         if let Some(waker) = self.waker.take() {
             waker.wake();

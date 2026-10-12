@@ -24,9 +24,10 @@ pub(crate) mod handler;
 pub(crate) mod transport;
 
 use std::{
-    collections::{HashMap, VecDeque, hash_map},
+    collections::{HashMap, HashSet, VecDeque, hash_map},
     convert::Infallible,
     io::{Error, IoSlice},
+    mem,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -88,6 +89,14 @@ enum ReservationStatus {
     Confirmed,
 }
 
+/// A reservation on a connection to a relay.
+struct RelayReservation {
+    /// The `/p2p-circuit` address we reserved on the relay.
+    addr: Multiaddr,
+    status: ReservationStatus,
+    listeners: HashSet<ListenerId>,
+}
+
 /// [`NetworkBehaviour`] implementation of the relay client
 /// functionality of the circuit relay v2 protocol.
 pub struct Behaviour {
@@ -98,17 +107,9 @@ pub struct Behaviour {
     /// connection.
     directly_connected_peers: HashMap<PeerId, Vec<ConnectionId>>,
 
-    /// Stores the address of a pending or confirmed reservation.
-    ///
-    /// This is indexed by the [`ConnectionId`] to a relay server and the address is the
-    /// `/p2p-circuit` address we reserved on it.
-    reservation_addresses: HashMap<ConnectionId, (Multiaddr, ReservationStatus)>,
-
-    /// Stores the [`ListenerId`] to the [`ConnectionId`] of the relay connection
-    /// that the listener's reservation is on. This allows us to expire external addresses
-    /// when a listener closes, but only if no other listener still holds a
-    /// reservation for the same address.
-    listener_id_to_connection_id: HashMap<ListenerId, ConnectionId>,
+    /// Reservations on relay connections. An entry exists only while at least one listener
+    /// uses it.
+    reservations: HashMap<ConnectionId, RelayReservation>,
 
     /// Queue of actions to return when polled.
     queued_actions: VecDeque<ToSwarm<Event, Either<handler::In, Infallible>>>,
@@ -123,8 +124,7 @@ pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
         local_peer_id,
         from_transport,
         directly_connected_peers: Default::default(),
-        reservation_addresses: Default::default(),
-        listener_id_to_connection_id: Default::default(),
+        reservations: Default::default(),
         queued_actions: Default::default(),
         pending_handler_commands: Default::default(),
     };
@@ -159,10 +159,11 @@ impl Behaviour {
                     unreachable!("`on_connection_closed` for unconnected peer.")
                 }
             };
-            self.listener_id_to_connection_id
-                .retain(|_, cid| *cid != connection_id);
-            if let Some((addr, ReservationStatus::Confirmed)) =
-                self.reservation_addresses.remove(&connection_id)
+            if let Some(RelayReservation {
+                addr,
+                status: ReservationStatus::Confirmed,
+                ..
+            }) = self.reservations.remove(&connection_id)
             {
                 self.queued_actions
                     .push_back(ToSwarm::ExternalAddrExpired(addr));
@@ -171,25 +172,25 @@ impl Behaviour {
     }
 
     fn on_listener_closed(&mut self, ListenerClosed { listener_id, .. }: ListenerClosed) {
-        let Some(connection_id) = self.listener_id_to_connection_id.remove(&listener_id) else {
+        let Some((&connection_id, reservation)) = self
+            .reservations
+            .iter_mut()
+            .find(|(_, reservation)| reservation.listeners.contains(&listener_id))
+        else {
             return;
         };
 
-        // Only expire the external address if no other listener still holds
-        // a reservation on the same connection. During reservation replacement the new listener is
-        // registered before the old one closes, so there will still be another entry, so we should
-        // not emit the event to expire the address address.
-        let listenr_and_connection = self
-            .listener_id_to_connection_id
-            .values()
-            .any(|cid| *cid == connection_id);
-
-        if listenr_and_connection {
+        // During a replacement the new listener is registered before the old one closes.
+        reservation.listeners.remove(&listener_id);
+        if !reservation.listeners.is_empty() {
             return;
         }
 
-        if let Some((addr, ReservationStatus::Confirmed)) =
-            self.reservation_addresses.remove(&connection_id)
+        if let Some(RelayReservation {
+            addr,
+            status: ReservationStatus::Confirmed,
+            ..
+        }) = self.reservations.remove(&connection_id)
         {
             self.queued_actions
                 .push_back(ToSwarm::ExternalAddrExpired(addr));
@@ -206,6 +207,36 @@ impl Behaviour {
                 handler: NotifyHandler::One(connection_id),
                 event: Either::Left(handler::In::Unreserve),
             });
+        }
+    }
+
+    fn register_listener(
+        &mut self,
+        connection_id: ConnectionId,
+        listener_id: ListenerId,
+        addr: Multiaddr,
+    ) {
+        match self.reservations.entry(connection_id) {
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(RelayReservation {
+                    addr,
+                    status: ReservationStatus::Pending,
+                    listeners: HashSet::from([listener_id]),
+                });
+            }
+            hash_map::Entry::Occupied(mut entry) => {
+                let reservation = entry.get_mut();
+                if reservation.addr != addr {
+                    let old_addr = mem::replace(&mut reservation.addr, addr);
+                    if mem::replace(&mut reservation.status, ReservationStatus::Pending)
+                        == ReservationStatus::Confirmed
+                    {
+                        self.queued_actions
+                            .push_back(ToSwarm::ExternalAddrExpired(old_addr));
+                    }
+                }
+                reservation.listeners.insert(listener_id);
+            }
         }
     }
 }
@@ -276,7 +307,7 @@ impl NetworkBehaviour for Behaviour {
             }
             FromSwarm::ListenerClosed(listener_closed) => self.on_listener_closed(listener_closed),
             FromSwarm::DialFailure(DialFailure { connection_id, .. }) => {
-                self.reservation_addresses.remove(&connection_id);
+                self.reservations.remove(&connection_id);
                 self.pending_handler_commands.remove(&connection_id);
             }
             _ => {}
@@ -296,12 +327,16 @@ impl NetworkBehaviour for Behaviour {
 
         let event = match handler_event {
             handler::Event::ReservationReqAccepted { renewal, limit } => {
-                match self.reservation_addresses.get_mut(&connection) {
-                    Some((addr, status)) => {
-                        if !renewal && *status == ReservationStatus::Pending {
-                            *status = ReservationStatus::Confirmed;
+                match self.reservations.get_mut(&connection) {
+                    // A replacement on the same connection is accepted as a renewal, so the
+                    // status decides, not `renewal`.
+                    Some(reservation) => {
+                        if reservation.status == ReservationStatus::Pending {
+                            reservation.status = ReservationStatus::Confirmed;
                             self.queued_actions
-                                .push_back(ToSwarm::ExternalAddrConfirmed(addr.clone()));
+                                .push_back(ToSwarm::ExternalAddrConfirmed(
+                                    reservation.addr.clone(),
+                                ));
                         }
                     }
                     // The listener was removed while the request was in flight.
@@ -342,112 +377,108 @@ impl NetworkBehaviour for Behaviour {
             return Poll::Ready(action);
         }
 
-        let action = match ready!(self.from_transport.poll_next_unpin(cx)) {
-            Some(transport::TransportToBehaviourMsg::ListenReq {
-                listener_id,
-                relay_peer_id,
-                relay_addr,
-                to_listener,
-            }) => {
-                match self
-                    .directly_connected_peers
-                    .get(&relay_peer_id)
-                    .and_then(|cs| cs.first())
-                {
-                    Some(connection_id) => {
-                        self.listener_id_to_connection_id
-                            .insert(listener_id, *connection_id);
-                        self.reservation_addresses.insert(
-                            *connection_id,
-                            (
-                                relay_addr
-                                    .with(Protocol::P2p(relay_peer_id))
-                                    .with(Protocol::P2pCircuit)
-                                    .with(Protocol::P2p(self.local_peer_id)),
-                                ReservationStatus::Pending,
-                            ),
+        loop {
+            let action = match ready!(self.from_transport.poll_next_unpin(cx)) {
+                Some(transport::TransportToBehaviourMsg::ListenReq {
+                    listener_id,
+                    relay_peer_id,
+                    relay_addr,
+                    to_listener,
+                }) => {
+                    if to_listener.is_closed() {
+                        tracing::debug!(
+                            relay=%relay_peer_id,
+                            ?listener_id,
+                            "Ignoring listen request of a listener that is already closed"
                         );
+                        continue;
+                    }
 
-                        ToSwarm::NotifyHandler {
-                            peer_id: relay_peer_id,
-                            handler: NotifyHandler::One(*connection_id),
-                            event: Either::Left(handler::In::Reserve { to_listener }),
+                    let addr = relay_addr
+                        .clone()
+                        .with(Protocol::P2p(relay_peer_id))
+                        .with(Protocol::P2pCircuit)
+                        .with(Protocol::P2p(self.local_peer_id));
+                    match self
+                        .directly_connected_peers
+                        .get(&relay_peer_id)
+                        .and_then(|cs| cs.first())
+                        .copied()
+                    {
+                        Some(connection_id) => {
+                            self.register_listener(connection_id, listener_id, addr);
+
+                            ToSwarm::NotifyHandler {
+                                peer_id: relay_peer_id,
+                                handler: NotifyHandler::One(connection_id),
+                                event: Either::Left(handler::In::Reserve { to_listener }),
+                            }
+                        }
+                        None => {
+                            let opts = DialOpts::peer_id(relay_peer_id)
+                                .addresses(vec![relay_addr])
+                                .extend_addresses_through_behaviour()
+                                .build();
+                            let relayed_connection_id = opts.connection_id();
+
+                            self.register_listener(relayed_connection_id, listener_id, addr);
+                            self.pending_handler_commands.insert(
+                                relayed_connection_id,
+                                handler::In::Reserve { to_listener },
+                            );
+                            ToSwarm::Dial { opts }
                         }
                     }
-                    None => {
-                        let opts = DialOpts::peer_id(relay_peer_id)
-                            .addresses(vec![relay_addr.clone()])
-                            .extend_addresses_through_behaviour()
-                            .build();
-                        let relayed_connection_id = opts.connection_id();
-
-                        self.listener_id_to_connection_id
-                            .insert(listener_id, relayed_connection_id);
-                        self.reservation_addresses.insert(
-                            relayed_connection_id,
-                            (
-                                relay_addr
-                                    .with(Protocol::P2p(relay_peer_id))
-                                    .with(Protocol::P2pCircuit)
-                                    .with(Protocol::P2p(self.local_peer_id)),
-                                ReservationStatus::Pending,
-                            ),
-                        );
-
-                        self.pending_handler_commands
-                            .insert(relayed_connection_id, handler::In::Reserve { to_listener });
-                        ToSwarm::Dial { opts }
-                    }
                 }
-            }
-            Some(transport::TransportToBehaviourMsg::DialReq {
-                relay_addr,
-                relay_peer_id,
-                dst_peer_id,
-                send_back,
-                ..
-            }) => {
-                match self
-                    .directly_connected_peers
-                    .get(&relay_peer_id)
-                    .and_then(|cs| cs.first())
-                {
-                    Some(connection_id) => ToSwarm::NotifyHandler {
-                        peer_id: relay_peer_id,
-                        handler: NotifyHandler::One(*connection_id),
-                        event: Either::Left(handler::In::EstablishCircuit {
-                            to_dial: send_back,
-                            dst_peer_id,
-                        }),
-                    },
-                    None => {
-                        let opts = DialOpts::peer_id(relay_peer_id)
-                            .addresses(vec![relay_addr])
-                            .extend_addresses_through_behaviour()
-                            .build();
-                        let connection_id = opts.connection_id();
-
-                        self.pending_handler_commands.insert(
-                            connection_id,
-                            handler::In::EstablishCircuit {
+                Some(transport::TransportToBehaviourMsg::DialReq {
+                    relay_addr,
+                    relay_peer_id,
+                    dst_peer_id,
+                    send_back,
+                    ..
+                }) => {
+                    match self
+                        .directly_connected_peers
+                        .get(&relay_peer_id)
+                        .and_then(|cs| cs.first())
+                    {
+                        Some(connection_id) => ToSwarm::NotifyHandler {
+                            peer_id: relay_peer_id,
+                            handler: NotifyHandler::One(*connection_id),
+                            event: Either::Left(handler::In::EstablishCircuit {
                                 to_dial: send_back,
                                 dst_peer_id,
-                            },
-                        );
+                            }),
+                        },
+                        None => {
+                            let opts = DialOpts::peer_id(relay_peer_id)
+                                .addresses(vec![relay_addr])
+                                .extend_addresses_through_behaviour()
+                                .build();
+                            let connection_id = opts.connection_id();
 
-                        ToSwarm::Dial { opts }
+                            self.pending_handler_commands.insert(
+                                connection_id,
+                                handler::In::EstablishCircuit {
+                                    to_dial: send_back,
+                                    dst_peer_id,
+                                },
+                            );
+
+                            ToSwarm::Dial { opts }
+                        }
                     }
                 }
-            }
-            None => unreachable!(
-                "`relay::Behaviour` polled after channel from \
+                None => unreachable!(
+                    "`relay::Behaviour` polled after channel from \
                      `Transport` has been closed. Unreachable under \
                      the assumption that the `client::Behaviour` is never polled after \
                      `client::Transport` is dropped.",
-            ),
-        };
+                ),
+            };
 
-        Poll::Ready(action)
+            return Poll::Ready(action);
+        }
     }
 }
 
@@ -589,5 +620,38 @@ impl AsyncRead for Connection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::task::noop_waker_ref;
+
+    use super::*;
+
+    #[test]
+    fn acceptance_without_reservation_is_reported_but_not_confirmed() {
+        let (_transport, mut behaviour) = new(PeerId::random());
+        let relay_peer_id = PeerId::random();
+
+        behaviour.on_connection_handler_event(
+            relay_peer_id,
+            ConnectionId::new_unchecked(1),
+            Either::Left(handler::Event::ReservationReqAccepted {
+                renewal: true,
+                limit: None,
+            }),
+        );
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        match behaviour.poll(&mut cx) {
+            Poll::Ready(ToSwarm::GenerateEvent(Event::ReservationReqAccepted {
+                relay_peer_id: peer_id,
+                renewal: true,
+                ..
+            })) => assert_eq!(peer_id, relay_peer_id),
+            other => panic!("{other:?}"),
+        }
+        assert!(behaviour.poll(&mut cx).is_pending());
     }
 }

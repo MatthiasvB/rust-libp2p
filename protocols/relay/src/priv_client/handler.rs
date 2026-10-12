@@ -250,6 +250,9 @@ impl ConnectionHandler for Handler {
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
+            In::Reserve { to_listener } if to_listener.is_closed() => {
+                tracing::debug!("Not making a reservation because its listener is closed");
+            }
             In::Reserve { to_listener } => {
                 self.make_new_reservation(to_listener);
             }

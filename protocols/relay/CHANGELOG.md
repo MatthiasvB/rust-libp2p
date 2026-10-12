@@ -19,6 +19,9 @@
 - Stop renewing a reservation after its relay listener was removed, and drop it on the connection handler right away.
   Accepting a reservation that no listener uses anymore no longer panics with `Relay connection exist`.
   See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+- Keep the external address of a relay reservation in step with its listeners.
+  Replacing a reservation on the same connection no longer leaves the address unexpirable, and a listener removed before its reservation request was sent no longer reserves or confirms anything.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
 
 ## 0.21.1
 - reduce allocations by replacing `get_or_insert` with `get_or_insert_with`

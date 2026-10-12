@@ -263,22 +263,7 @@ async fn removed_relay_listener_is_not_renewed() {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
-    let relay_addr = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
-    let mut relay = build_relay();
-    let relay_peer_id = *relay.local_peer_id();
-
-    relay.listen_on(relay_addr.clone()).unwrap();
-    relay.add_external_address(relay_addr.clone());
-    let (relay_events_tx, relay_events) = mpsc::channel();
-    tokio::spawn(async move {
-        loop {
-            if let SwarmEvent::Behaviour(RelayEvent::Relay(event)) = relay.select_next_some().await
-            {
-                let _ = relay_events_tx.send(event);
-            }
-        }
-    });
-
+    let (relay_addr, relay_peer_id, relay_events) = spawn_relay_with_events();
     let mut client = build_client();
     let client_peer_id = *client.local_peer_id();
     let client_addr = relay_addr
@@ -325,52 +310,153 @@ async fn removed_relay_listener_is_not_renewed() {
 }
 
 #[tokio::test]
-async fn reservation_accepted_after_listener_removal_is_not_confirmed() {
+async fn listener_removed_before_relay_connection_reserves_nothing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
-    let relay_addr = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
-    let mut relay = build_relay();
-    let relay_peer_id = *relay.local_peer_id();
-
-    relay.listen_on(relay_addr.clone()).unwrap();
-    relay.add_external_address(relay_addr.clone());
-    tokio::spawn(async move {
-        relay.collect::<Vec<_>>().await;
-    });
-
+    let (relay_addr, relay_peer_id, relay_events) = spawn_relay_with_events();
     let mut client = build_client();
     let client_addr = relay_addr
         .with(Protocol::P2p(relay_peer_id))
         .with(Protocol::P2pCircuit);
 
-    // The listener is gone before the connection to the relay exists, so the reservation
-    // request is still made and accepted for a listener nobody tracks anymore.
     let listener_id = client.listen_on(client_addr).unwrap();
     client
         .wait(|event| matches!(event, SwarmEvent::Dialing { .. }).then_some(()))
         .await;
     assert!(client.remove_listener(listener_id));
 
-    loop {
+    assert_no_reservation(&mut client, &relay_events).await;
+}
+
+#[tokio::test]
+async fn listener_removed_right_after_listen_on_reserves_nothing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
+    let (relay_addr, relay_peer_id, relay_events) = spawn_relay_with_events();
+    let mut client = build_client();
+    let client_addr = relay_addr
+        .with(Protocol::P2p(relay_peer_id))
+        .with(Protocol::P2pCircuit);
+
+    let listener_id = client.listen_on(client_addr).unwrap();
+    assert!(client.remove_listener(listener_id));
+
+    assert_no_reservation(&mut client, &relay_events).await;
+}
+
+#[tokio::test]
+async fn replacement_then_removal_expires_external_address() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
+    let (relay_addr, relay_peer_id, _relay_events) = spawn_relay_with_events();
+    let mut client = build_client();
+    let client_peer_id = *client.local_peer_id();
+    let client_addr = relay_addr
+        .with(Protocol::P2p(relay_peer_id))
+        .with(Protocol::P2pCircuit);
+    let client_addr_with_peer_id = client_addr.clone().with(Protocol::P2p(client_peer_id));
+
+    let old_listener = client.listen_on(client_addr.clone()).unwrap();
+    assert!(wait_for_dial(&mut client, relay_peer_id).await);
+    wait_for_reservation(
+        &mut client,
+        client_addr_with_peer_id.clone(),
+        relay_peer_id,
+        false, // No renewal.
+    )
+    .await;
+
+    let new_listener = client.listen_on(client_addr).unwrap();
+    let mut old_listener_closed = false;
+    let mut new_listener_address_reported = false;
+    while !(old_listener_closed && new_listener_address_reported) {
         match client.select_next_some().await {
-            SwarmEvent::Behaviour(ClientEvent::Relay(
-                relay::client::Event::ReservationReqAccepted {
-                    relay_peer_id: peer_id,
-                    renewal: false,
-                    ..
-                },
-            )) => {
-                assert_eq!(peer_id, relay_peer_id);
-                break;
+            SwarmEvent::ListenerClosed { listener_id, .. } => {
+                assert_eq!(listener_id, old_listener);
+                old_listener_closed = true;
             }
-            SwarmEvent::ConnectionEstablished { .. }
+            SwarmEvent::NewListenAddr { listener_id, .. } => {
+                assert_eq!(listener_id, new_listener);
+                new_listener_address_reported = true;
+            }
+            SwarmEvent::Behaviour(ClientEvent::Relay(
+                relay::client::Event::ReservationReqAccepted { .. },
+            ))
+            | SwarmEvent::Behaviour(ClientEvent::Ping(_)) => {}
+            e => panic!("{e:?}"),
+        }
+    }
+
+    assert!(client.remove_listener(new_listener));
+
+    let mut external_addr_expired = 0;
+    let mut deadline = Delay::new(Duration::from_secs(1));
+    loop {
+        let event = match future::select(client.select_next_some(), &mut deadline).await {
+            Either::Left((event, _)) => event,
+            Either::Right(_) => break,
+        };
+        match event {
+            SwarmEvent::ExternalAddrExpired { address } => {
+                assert_eq!(address, client_addr_with_peer_id);
+                external_addr_expired += 1;
+            }
+            SwarmEvent::ListenerClosed { .. }
+            | SwarmEvent::ExpiredListenAddr { .. }
+            | SwarmEvent::ConnectionClosed { .. }
+            | SwarmEvent::Behaviour(ClientEvent::Ping(_)) => {}
+            e => panic!("{e:?}"),
+        }
+    }
+    assert_eq!(external_addr_expired, 1);
+}
+
+fn spawn_relay_with_events() -> (Multiaddr, PeerId, mpsc::Receiver<relay::Event>) {
+    let relay_addr = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+    let mut relay = build_relay();
+    let relay_peer_id = *relay.local_peer_id();
+
+    relay.listen_on(relay_addr.clone()).unwrap();
+    relay.add_external_address(relay_addr.clone());
+    let (relay_events_tx, relay_events) = mpsc::channel();
+    tokio::spawn(async move {
+        loop {
+            if let SwarmEvent::Behaviour(RelayEvent::Relay(event)) = relay.select_next_some().await
+            {
+                let _ = relay_events_tx.send(event);
+            }
+        }
+    });
+
+    (relay_addr, relay_peer_id, relay_events)
+}
+
+async fn assert_no_reservation(
+    client: &mut Swarm<Client>,
+    relay_events: &mpsc::Receiver<relay::Event>,
+) {
+    let mut deadline = Delay::new(Duration::from_secs(1));
+    loop {
+        let event = match future::select(client.select_next_some(), &mut deadline).await {
+            Either::Left((event, _)) => event,
+            Either::Right(_) => break,
+        };
+        match event {
+            SwarmEvent::Dialing { .. }
+            | SwarmEvent::ConnectionEstablished { .. }
+            | SwarmEvent::ConnectionClosed { .. }
             | SwarmEvent::ListenerClosed { .. }
             | SwarmEvent::Behaviour(ClientEvent::Ping(_)) => {}
             e => panic!("{e:?}"),
         }
     }
+    assert_eq!(count_reservations(relay_events), 0);
 }
 
 fn count_reservations(relay_events: &mpsc::Receiver<relay::Event>) -> usize {
