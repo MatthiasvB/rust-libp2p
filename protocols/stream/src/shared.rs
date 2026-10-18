@@ -9,7 +9,7 @@ use libp2p_identity::PeerId;
 use libp2p_swarm::{ConnectionId, Stream, StreamProtocol};
 use rand::seq::IteratorRandom as _;
 
-use crate::{AlreadyRegistered, IncomingStreams, handler::NewStream};
+use crate::{AlreadyRegistered, Config, IncomingStreams, handler::NewStream};
 
 pub(crate) struct Shared {
     /// Tracks the supported inbound protocols created via
@@ -19,7 +19,7 @@ pub(crate) struct Shared {
     /// [`mpsc::Receiver`] in [`IncomingStreams`].
     supported_inbound_protocols: HashMap<StreamProtocol, mpsc::Sender<(PeerId, Stream)>>,
 
-    connections: HashMap<ConnectionId, PeerId>,
+    connections: HashMap<ConnectionId, Connection>,
     senders: HashMap<ConnectionId, mpsc::Sender<NewStream>>,
 
     /// Tracks channel pairs for a peer whilst we are dialing them.
@@ -30,6 +30,13 @@ pub(crate) struct Shared {
     /// We manage this through a channel to avoid locks as part of
     /// [`NetworkBehaviour::poll`](libp2p_swarm::NetworkBehaviour::poll).
     dial_sender: mpsc::Sender<PeerId>,
+
+    config: Config,
+}
+
+struct Connection {
+    peer: PeerId,
+    relayed: bool,
 }
 
 impl Shared {
@@ -39,9 +46,10 @@ impl Shared {
 }
 
 impl Shared {
-    pub(crate) fn new(dial_sender: mpsc::Sender<PeerId>) -> Self {
+    pub(crate) fn new(dial_sender: mpsc::Sender<PeerId>, config: Config) -> Self {
         Self {
             dial_sender,
+            config,
             connections: Default::default(),
             senders: Default::default(),
             pending_channels: Default::default(),
@@ -99,8 +107,18 @@ impl Shared {
         }
     }
 
-    pub(crate) fn on_connection_established(&mut self, conn: ConnectionId, peer: PeerId) {
-        self.connections.insert(conn, peer);
+    /// Whether streams may use a connection, given whether it is relayed.
+    pub(crate) fn is_eligible(&self, relayed: bool) -> bool {
+        !relayed || self.config.relayed_connections
+    }
+
+    pub(crate) fn on_connection_established(
+        &mut self,
+        conn: ConnectionId,
+        peer: PeerId,
+        relayed: bool,
+    ) {
+        self.connections.insert(conn, Connection { peer, relayed });
     }
 
     pub(crate) fn on_connection_closed(&mut self, conn: ConnectionId) {
@@ -122,11 +140,12 @@ impl Shared {
         }
     }
 
-    pub(crate) fn sender(&mut self, peer: PeerId) -> mpsc::Sender<NewStream> {
+    pub(crate) fn sender(&mut self, peer: PeerId) -> io::Result<mpsc::Sender<NewStream>> {
         let maybe_sender = self
             .connections
             .iter()
-            .filter_map(|(c, p)| (p == &peer).then_some(c))
+            .filter(|(_, c)| c.peer == peer && self.is_eligible(c.relayed))
+            .map(|(id, _)| id)
             .choose(&mut rand::thread_rng())
             .and_then(|c| self.senders.get(c));
 
@@ -134,10 +153,18 @@ impl Shared {
             Some(sender) => {
                 tracing::debug!("Returning sender to existing connection");
 
-                sender.clone()
+                Ok(sender.clone())
+            }
+            None if !self.config.dialing => {
+                tracing::debug!(%peer, "No eligible connection to peer and dialing is disabled");
+
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no eligible connection to peer and dialing is disabled",
+                ))
             }
             None => {
-                tracing::debug!(%peer, "Not connected to peer, initiating dial");
+                tracing::debug!(%peer, "No eligible connection to peer, initiating dial");
 
                 let (sender, _) = self
                     .pending_channels
@@ -146,7 +173,7 @@ impl Shared {
 
                 let _ = self.dial_sender.try_send(peer);
 
-                sender.clone()
+                Ok(sender.clone())
             }
         }
     }
@@ -155,8 +182,11 @@ impl Shared {
         &mut self,
         peer: PeerId,
         connection: ConnectionId,
+        relayed: bool,
     ) -> mpsc::Receiver<NewStream> {
-        if let Some((sender, receiver)) = self.pending_channels.remove(&peer) {
+        if self.is_eligible(relayed)
+            && let Some((sender, receiver)) = self.pending_channels.remove(&peer)
+        {
             tracing::debug!(%peer, %connection, "Returning existing pending receiver");
 
             self.senders.insert(connection, sender);
@@ -169,5 +199,107 @@ impl Shared {
         self.senders.insert(connection, sender);
 
         receiver
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared(config: Config) -> (Shared, mpsc::Receiver<PeerId>) {
+        let (dial_sender, dial_receiver) = mpsc::channel(0);
+
+        (Shared::new(dial_sender, config), dial_receiver)
+    }
+
+    /// Registers a connection the way [`Behaviour`](crate::Behaviour) does.
+    fn connect(
+        shared: &mut Shared,
+        id: usize,
+        peer: PeerId,
+        relayed: bool,
+    ) -> (ConnectionId, mpsc::Receiver<NewStream>) {
+        let connection = ConnectionId::new_unchecked(id);
+        let receiver = shared.receiver(peer, connection, relayed);
+        shared.on_connection_established(connection, peer, relayed);
+
+        (connection, receiver)
+    }
+
+    fn is_sender_of(shared: &Shared, sender: &mpsc::Sender<NewStream>, conn: ConnectionId) -> bool {
+        sender.same_receiver(&shared.senders[&conn])
+    }
+
+    #[test]
+    fn picks_only_direct_connections_when_relayed_are_disallowed() {
+        let (mut shared, _dials) = shared(Config::default().with_relayed_connections(false));
+        let peer = PeerId::random();
+        connect(&mut shared, 0, peer, true);
+        let (direct, _receiver) = connect(&mut shared, 1, peer, false);
+        connect(&mut shared, 2, peer, true);
+
+        for _ in 0..32 {
+            let sender = shared.sender(peer).unwrap();
+            assert!(is_sender_of(&shared, &sender, direct));
+        }
+    }
+
+    #[test]
+    fn picks_relayed_connections_by_default() {
+        let (mut shared, _dials) = shared(Config::default());
+        let peer = PeerId::random();
+        let (relayed, _receiver) = connect(&mut shared, 0, peer, true);
+
+        let sender = shared.sender(peer).unwrap();
+
+        assert!(is_sender_of(&shared, &sender, relayed));
+    }
+
+    #[test]
+    fn fails_without_dialing_when_only_relayed_connections_exist() {
+        let (mut shared, mut dials) = shared(
+            Config::default()
+                .with_relayed_connections(false)
+                .with_dialing(false),
+        );
+        let peer = PeerId::random();
+        connect(&mut shared, 0, peer, true);
+
+        let error = shared.sender(peer).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(dials.try_next().is_err(), "no dial is requested");
+        assert!(shared.pending_channels.is_empty());
+    }
+
+    #[test]
+    fn fails_without_dialing_when_not_connected() {
+        let (mut shared, mut dials) = shared(Config::default().with_dialing(false));
+
+        let error = shared.sender(PeerId::random()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(dials.try_next().is_err(), "no dial is requested");
+        assert!(shared.pending_channels.is_empty());
+    }
+
+    #[test]
+    fn dials_when_only_relayed_connections_exist() {
+        let (mut shared, mut dials) = shared(Config::default().with_relayed_connections(false));
+        let peer = PeerId::random();
+        connect(&mut shared, 0, peer, true);
+
+        let sender = shared.sender(peer).unwrap();
+
+        assert_eq!(dials.try_next().unwrap(), Some(peer));
+
+        // A new relayed connection must not take over the streams waiting for the dial.
+        let (relayed, _receiver) = connect(&mut shared, 1, peer, true);
+        assert!(!is_sender_of(&shared, &sender, relayed));
+        assert!(shared.pending_channels.contains_key(&peer));
+
+        let (direct, _receiver) = connect(&mut shared, 2, peer, false);
+        assert!(is_sender_of(&shared, &sender, direct));
+        assert!(shared.pending_channels.is_empty());
     }
 }

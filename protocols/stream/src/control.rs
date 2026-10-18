@@ -32,6 +32,8 @@ impl Control {
     ///
     /// In case we are currently not connected to the peer,
     /// we will attempt to make a new connection.
+    /// Connections that [`Config`](crate::Config) rules out count as not connected.
+    /// If dialing is disabled, this fails with [`io::ErrorKind::NotConnected`] instead.
     ///
     /// ## Backpressure
     ///
@@ -48,7 +50,7 @@ impl Control {
     ) -> Result<Stream, OpenStreamError> {
         tracing::debug!(%peer, "Requesting new stream");
 
-        let mut new_stream_sender = Shared::lock(&self.shared).sender(peer);
+        let mut new_stream_sender = Shared::lock(&self.shared).sender(peer)?;
 
         let (sender, receiver) = oneshot::channel();
 

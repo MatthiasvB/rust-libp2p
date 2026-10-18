@@ -20,6 +20,8 @@ use crate::{OpenStreamError, shared::Shared, upgrade::Upgrade};
 pub struct Handler {
     remote: PeerId,
     shared: Arc<Mutex<Shared>>,
+    /// Whether to offer the accepted protocols on this connection.
+    offer_inbound: bool,
 
     receiver: mpsc::Receiver<NewStream>,
     pending_upgrade: Option<(
@@ -33,9 +35,11 @@ impl Handler {
         remote: PeerId,
         shared: Arc<Mutex<Shared>>,
         receiver: mpsc::Receiver<NewStream>,
+        offer_inbound: bool,
     ) -> Self {
         Self {
             shared,
+            offer_inbound,
             receiver,
             pending_upgrade: None,
             remote,
@@ -52,9 +56,15 @@ impl ConnectionHandler for Handler {
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> swarm::SubstreamProtocol<Self::InboundProtocol> {
+        let supported_protocols = if self.offer_inbound {
+            Shared::lock(&self.shared).supported_inbound_protocols()
+        } else {
+            Vec::new()
+        };
+
         swarm::SubstreamProtocol::new(
             Upgrade {
-                supported_protocols: Shared::lock(&self.shared).supported_inbound_protocols(),
+                supported_protocols,
             },
             (),
         )

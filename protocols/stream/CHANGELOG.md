@@ -3,6 +3,12 @@
 - Raise MSRV to 1.88.0.
   See [PR 6273](https://github.com/libp2p/rust-libp2p/pull/6273).
 
+- Add `Config` and `Behaviour::with_config`.
+  `Config::with_relayed_connections(false)` keeps streams off relayed connections in both directions.
+  `Config::with_dialing(false)` makes `Control::open_stream` fail with `io::ErrorKind::NotConnected` instead of dialing.
+  The defaults keep the previous behaviour.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+
 ## 0.4.0-alpha
 
 - Garbage-collect deregistered streams when accepting new streams.

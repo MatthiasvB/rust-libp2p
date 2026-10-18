@@ -1,6 +1,6 @@
 use std::io;
 
-use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
+use futures::{AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
 use libp2p_identity::PeerId;
 use libp2p_stream as stream;
 use libp2p_swarm::{StreamProtocol, Swarm};
@@ -77,4 +77,56 @@ async fn dial_errors_are_propagated() {
 
     assert_eq!(e.kind(), io::ErrorKind::NotConnected);
     assert_eq!("Dial error: no addresses for peer.", e.to_string());
+}
+
+#[tokio::test]
+async fn open_stream_without_dialing_fails_fast_when_not_connected() {
+    let swarm = Swarm::new_ephemeral_tokio(|_| {
+        stream::Behaviour::with_config(stream::Config::default().with_dialing(false))
+    });
+
+    let mut control = swarm.behaviour().new_control();
+
+    let error = control
+        .open_stream(PeerId::random(), PROTOCOL)
+        .now_or_never()
+        .expect("fails without waiting")
+        .unwrap_err();
+
+    let OpenStreamError::Io(e) = error else {
+        panic!("Unexpected error: {error}")
+    };
+    assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+}
+
+#[tokio::test]
+async fn open_stream_without_dialing_uses_a_direct_connection() {
+    let config = stream::Config::default()
+        .with_dialing(false)
+        .with_relayed_connections(false);
+    let mut swarm1 = Swarm::new_ephemeral_tokio(|_| stream::Behaviour::with_config(config));
+    let mut swarm2 = Swarm::new_ephemeral_tokio(|_| stream::Behaviour::with_config(config));
+
+    let mut control = swarm1.behaviour().new_control();
+    let mut incoming = swarm2.behaviour().new_control().accept(PROTOCOL).unwrap();
+
+    swarm2.listen().with_memory_addr_external().await;
+    swarm1.connect(&mut swarm2).await;
+
+    let swarm2_peer_id = *swarm2.local_peer_id();
+
+    tokio::spawn(async move {
+        while let Some((_, mut stream)) = incoming.next().await {
+            stream.write_all(&[42]).await.unwrap();
+            stream.close().await.unwrap();
+        }
+    });
+    tokio::spawn(swarm1.loop_on_next());
+    tokio::spawn(swarm2.loop_on_next());
+
+    let mut stream = control.open_stream(swarm2_peer_id, PROTOCOL).await.unwrap();
+
+    let mut buf = [0u8; 1];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!([42], buf);
 }
