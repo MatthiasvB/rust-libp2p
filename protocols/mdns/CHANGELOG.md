@@ -3,6 +3,9 @@
 - Raise MSRV to 1.88.0.
   See [PR 6273](https://github.com/libp2p/rust-libp2p/pull/6273).
 
+- Fix a panic with "overflow when adding duration to instant" when the tokio expiry timer is polled more than 5 ms late.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+
 ## 0.48.0
 
 - Remove `async_std` dependency [PR 5958](https://github.com/libp2p/rust-libp2p/pull/5958)

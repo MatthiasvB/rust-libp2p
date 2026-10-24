@@ -28,7 +28,7 @@ tokio = ["dep:tokio", "if-watch/tokio"]
 
 [dev-dependencies]
 libp2p-swarm = { workspace = true, features = ["tokio"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
 libp2p-swarm-test = { path = "../../swarm-test" }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 

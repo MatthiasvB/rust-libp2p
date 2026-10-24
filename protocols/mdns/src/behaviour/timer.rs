@@ -44,49 +44,91 @@ pub trait Builder: Send + Unpin + 'static {
 pub(crate) mod tokio {
     use std::{
         pin::Pin,
-        task::{Context, Poll},
+        task::{Context, Poll, ready},
     };
 
-    use ::tokio::time::{self, Instant as TokioInstant, Interval, MissedTickBehavior};
+    use ::tokio::time::{self, Instant as TokioInstant, Interval, MissedTickBehavior, Sleep};
     use futures::Stream;
 
     use super::*;
 
     /// Tokio wrapper
-    pub(crate) type TokioTimer = Timer<Interval>;
+    pub(crate) type TokioTimer = Timer<Inner>;
+
+    #[derive(Debug)]
+    pub enum Inner {
+        /// Fires once at its deadline and is `None` after that.
+        Once(Option<Pin<Box<Sleep>>>),
+        Interval(Interval),
+    }
+
     impl Builder for TokioTimer {
         fn at(instant: Instant) -> Self {
-            // Taken from: https://docs.rs/async-io/1.7.0/src/async_io/lib.rs.html#91
-            let mut inner = time::interval_at(
-                TokioInstant::from_std(instant),
-                Duration::new(u64::MAX, 1_000_000_000 - 1),
-            );
-            inner.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            Self { inner }
+            let sleep = time::sleep_until(TokioInstant::from_std(instant));
+            Self {
+                inner: Inner::Once(Some(Box::pin(sleep))),
+            }
         }
 
         fn interval(duration: Duration) -> Self {
             let mut inner = time::interval_at(TokioInstant::now() + duration, duration);
             inner.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            Self { inner }
+            Self {
+                inner: Inner::Interval(inner),
+            }
         }
 
         fn interval_at(start: Instant, duration: Duration) -> Self {
             let mut inner = time::interval_at(TokioInstant::from_std(start), duration);
             inner.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            Self { inner }
+            Self {
+                inner: Inner::Interval(inner),
+            }
         }
     }
 
     impl Stream for TokioTimer {
         type Item = TokioInstant;
 
+        /// A one-shot timer stays pending after it fired.
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            self.inner.poll_tick(cx).map(Some)
+            match &mut self.inner {
+                Inner::Once(sleep) => {
+                    let Some(pending) = sleep else {
+                        return Poll::Pending;
+                    };
+                    ready!(pending.as_mut().poll(cx));
+                    let deadline = pending.deadline();
+                    *sleep = None;
+                    Poll::Ready(Some(deadline))
+                }
+                Inner::Interval(interval) => interval.poll_tick(cx).map(Some),
+            }
         }
 
         fn size_hint(&self) -> (usize, Option<usize>) {
             (usize::MAX, None)
         }
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+    use std::time::Duration;
+
+    use futures::StreamExt as _;
+    use tokio::time::{self, Instant};
+
+    use super::{Builder as _, tokio::TokioTimer};
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_polled_late_fires_once() {
+        let mut timer = TokioTimer::at(Instant::now().into_std());
+
+        time::advance(Duration::from_secs(3600)).await;
+
+        assert!(timer.next().await.is_some());
+        let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        assert!(time::timeout(ten_years, timer.next()).await.is_err());
     }
 }
